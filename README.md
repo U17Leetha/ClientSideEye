@@ -1,162 +1,155 @@
 # ClientSideEye
 
-ClientSideEye is a small Playwright-based CLI for **authorized** web app security testing that helps identify:
-- **Client-side “filtering” / hidden UI controls** (buttons/links/inputs hidden or disabled in DOM/CSS)
-- **Password masking issues** (masked fields with plaintext still present in `.value` or `value=""`)
-- **Role/permission hints** in DOM attributes (e.g. `data-role`, `data-permission`, etc.)
+ClientSideEye is a Playwright-based CLI for **authorized** web application security testing focused on identifying **client-side control weaknesses**, including:
 
-It generates:
-- A **JSON report** (default: `client_controls_report.json`)
-- A **human-readable terminal summary** (default stdout)
+- Hidden or disabled UI controls used as access control
+- Password masking issues where secrets remain in the DOM
+- Role / permission hints embedded in client-side attributes
 
-> ⚠️ Authorized testing only. Do not use on systems you don’t own or have explicit permission to assess.
+It produces:
+- A **JSON report** suitable for evidence and tooling
+- A **human-readable terminal summary** for fast triage
+
+> ⚠️ Authorized testing only. Do not use against systems you do not own or explicitly have permission to assess.
 
 ---
 
 ## Install
 
 ### Requirements
-- Node.js 18+ (works great on 20+)
-- Playwright + Chromium
+- Node.js 18+
+- Playwright (Chromium)
 
 ### Clone & setup
+
 ```bash
 git clone https://github.com/YOURNAME/ClientSideEye.git
 cd ClientSideEye
 npm install
 npx playwright install chromium
 Make the CLI available
-Option A (recommended for dev): local link
+Option A – Local development (recommended)
 
 npm link
-Option B: run directly
+Option B – Run directly
 
 node src/clientsideeye.mjs --help
 CLI Options
 Synopsis
 clientsideeye <url> [options]
-Auth
+Authentication
 --storage-state <auth.json>
-
-Use Playwright storage state (best for SSO/MFA flows)
+Use Playwright storage state (recommended for SSO / MFA flows)
 
 --header "Name: value" (repeatable)
+Inject arbitrary HTTP headers
+Examples:
 
-Add an HTTP header (ex: Authorization: Bearer ..., Cookie: ...)
+Authorization: Bearer …
+
+Cookie: ASP.NET_SessionId=…
 
 --cookie "name=value" (repeatable)
-
-Add a cookie into the Playwright cookie jar for the target domain
+Inject cookies via Playwright’s cookie jar
 
 Modes
 --mode report|soft-unhide|aggressive (default: report)
 
 report
-Detect only. Does not modify the page.
+Detection only. No DOM modification.
 
 soft-unhide
-Attempts to reveal hidden elements (CSS/hidden/aria-hidden).
-Does not remove disabled by default.
+Reveals elements hidden via CSS, hidden, or aria-hidden.
 
 aggressive
-More invasive. Also removes disabled / aria-disabled and common “disabled” class tokens.
+Also removes disabled, aria-disabled, and common disabled class tokens.
 
 Scope
 --scope all|buttons (default: all)
 
-all scans common interactive elements (button, a, input, etc.)
+all – Scan all common interactive elements
 
-buttons focuses on primary click targets (button, [role=button], links, etc.)
+buttons – Focus on primary action controls
 
 Output
 --out <file.json> (default: client_controls_report.json)
-
 JSON report file path
 
 --output text|json (default: text)
-
 Controls stdout format (JSON file is still written)
 
 --quiet
-
-Minimal stdout (still writes JSON file)
+Minimal terminal output
 
 --max-items <n> (default: 20)
-
-Limit how many findings are printed in terminal output
+Max findings printed to stdout
 
 --show-html
-
-Include clipped outerHTML evidence in terminal output
+Include clipped outerHTML in terminal output
 
 --no-redact
+Disable secret redaction in JSON (not recommended)
 
-Write full auth values into the JSON report (NOT recommended)
-
-DevTools / inspection
+DevTools / Inspection
 --devtools
-
-Launch Chromium with DevTools open (headed only, use HEADLESS=0)
+Launch Chromium with DevTools open (requires HEADLESS=0)
 
 --focus password|hidden
-
-Scroll + outline the first matching finding for fast manual inspection
+Scroll to and highlight the first matching finding
 
 --pause
+Keep browser open after scan for manual inspection
 
-Keep the browser open after the scan (so you can inspect/click around)
-
-Timing / safety
+Timing / Safety
 --wait-ms <ms> (default: 5000)
-
-Wait after initial page load (helpful for SPAs)
+Delay after page load (useful for SPAs)
 
 --limit <n> (default: 250)
-
-Cap number of nodes inspected (prevents runaway scans on huge pages)
+Cap number of DOM nodes inspected
 
 Environment
 HEADLESS=0
+Run with visible browser UI
 
-Run headed (show browser UI). Default behavior is headless.
-
-Help / version
+Help / Version
 -h, --help
 
 -v, --version
 
 Uses / Examples
-1) Basic scan (headless)
+Basic scan (headless)
 clientsideeye 'https://target/app/page'
-2) Headed run with DevTools + focus the first password issue
-HEADLESS=0 clientsideeye 'https://target/app/page' --devtools --focus password --pause
-3) Auth via Cookie header (quote carefully)
+Headed scan with DevTools and password focus
+HEADLESS=0 clientsideeye 'https://target/app/page' \
+  --devtools \
+  --focus password \
+  --pause
+Authenticated scan using cookies
 HEADLESS=0 clientsideeye 'https://target/app/page' \
   --header 'Cookie: .ASPXFORMSAUTH=XXX; ASP.NET_SessionId=YYY' \
-  --devtools --focus hidden --pause
-4) Auth via Authorization header
+  --focus hidden \
+  --pause
+Auth via Authorization header
 clientsideeye 'https://target/app/page' \
-  --header 'Authorization: Bearer YOUR_TOKEN_HERE'
-5) Auth via Playwright storage state (best for SSO/MFA)
-Create auth.json using Playwright (or export from an existing flow), then:
-
-clientsideeye 'https://target/app/page' --storage-state auth.json
-6) Reveal hidden controls (soft)
-HEADLESS=0 clientsideeye 'https://target/app/page' --mode soft-unhide --pause
-7) Reveal + enable controls (aggressive)
-HEADLESS=0 clientsideeye 'https://target/app/page' --mode aggressive --pause
-8) Print JSON to stdout (still writes JSON file too)
+  --header 'Authorization: Bearer YOUR_TOKEN'
+Reveal hidden controls
+HEADLESS=0 clientsideeye 'https://target/app/page' \
+  --mode soft-unhide \
+  --pause
+Aggressive reveal (enable disabled controls)
+HEADLESS=0 clientsideeye 'https://target/app/page' \
+  --mode aggressive \
+  --pause
+JSON output to stdout
 clientsideeye 'https://target/app/page' --output json
-9) Increase wait time for SPAs
-clientsideeye 'https://target/app/page' --wait-ms 12000
-Notes on findings
-Hidden/disabled controls are not automatically a vuln. The point is to quickly locate UI-driven restrictions that should be backed by server-side authorization.
+Notes on Findings
+Hidden UI ≠ vulnerability by itself.
+The value is in quickly identifying UI-only restrictions that must be validated server-side.
 
-Password masking issues are often high-signal: if secrets appear in DOM/JS, they can often be extracted by lower-privileged users.
+Password masking findings are high signal when secrets exist in DOM or JS state.
 
-Always validate with server-side requests (Burp, etc.) before concluding impact.
+Always confirm impact with server-side testing.
 
-Responsible use
-ClientSideEye is intended for defensive security and authorized assessments only.
-You are responsible for ensuring you have permission to test the target(s).
-
+Responsible Use
+ClientSideEye is intended for authorized security testing only.
+You are responsible for ensuring you have permission to assess any target.
