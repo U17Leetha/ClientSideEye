@@ -41,24 +41,27 @@ Option B – Run directly
 ```bash
 node src/clientsideeye.mjs --help
 ```
-CLI Options
-Synopsis
+## CLI Options
+```bash
 clientsideeye <url> [options]
-
-Authentication
-
+```
+## Authentication
+```bash
 --storage-state <auth.json>
 Use Playwright storage state (recommended for SSO / MFA flows)
-
+```
+```bash
 --header "Name: value" (repeatable)
+```
 Inject arbitrary HTTP headers
 Examples:
 
 Authorization: Bearer …
 
 Cookie: ASP.NET_SessionId=…
-
+```
 --cookie "name=value" (repeatable)
+```
 Inject cookies via Playwright’s cookie jar
 
 Modes
