@@ -2,28 +2,29 @@
 
 ClientSideEye is a Playwright-based CLI for authorized web application security testing focused on identifying client-side control weaknesses, including:
 
-Hidden or disabled UI controls used as access control
+- Hidden or disabled UI controls used as access control
 
-Password masking issues where secrets remain in the DOM
+- Password masking issues where secrets remain in the DOM
 
-Role / permission hints embedded in client-side attributes
+- Role / permission hints embedded in client-side attributes
 
-It produces:
+#### It produces:
 
-A JSON report suitable for evidence and tooling
+- A JSON report suitable for evidence and tooling
 
-A human-readable terminal summary for fast triage
+- A human-readable terminal summary for fast triage
 
 ⚠️ Authorized testing only. Do not use against systems you do not own or explicitly have permission to assess.
 
-## Install
-Requirements
+## Installation
+
+### Requirements
 
 Node.js 18+
 
 Playwright (Chromium)
 
-## Clone & setup
+### Clone & setup
 ```bash
 git clone https://github.com/YOURNAME/ClientSideEye.git
 cd ClientSideEye
