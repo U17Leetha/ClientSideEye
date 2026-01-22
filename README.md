@@ -46,12 +46,9 @@ node src/clientsideeye.mjs --help
 clientsideeye <url> [options]
 ```
 ## Authentication
+Use Playwright storage state (recommended for SSO / MFA flows)
 ```bash
 --storage-state <auth.json>
-Use Playwright storage state (recommended for SSO / MFA flows)
-```
-```bash
---header "Name: value" (repeatable)
 ```
 Inject arbitrary HTTP headers
 Examples:
@@ -59,116 +56,149 @@ Examples:
 Authorization: Bearer …
 
 Cookie: ASP.NET_SessionId=…
+```bash
+--header "Name: value" (repeatable)
+```
+Inject cookies via Playwright’s cookie jar
 ```
 --cookie "name=value" (repeatable)
 ```
-Inject cookies via Playwright’s cookie jar
 
-Modes
+## Modes
 
+```bash
 --mode report|soft-unhide|aggressive (default: report)
-
-report
+```
+#### report
 Detection only. No DOM modification.
 
-soft-unhide
+#### soft-unhide
 Reveals elements hidden via CSS, hidden, or aria-hidden.
 
-aggressive
+#### aggressive
 Also removes disabled, aria-disabled, and common disabled class tokens.
 
-Scope
-
+## Scope
+```bash
 --scope all|buttons (default: all)
+```
+#### all – Scan all common interactive elements
 
-all – Scan all common interactive elements
+#### buttons – Focus on primary action controls
 
-buttons – Focus on primary action controls
-
-Output
-
---out <file.json> (default: client_controls_report.json)
+## Output
 JSON report file path
-
---output text|json (default: text)
+```bash
+--out <file.json> (default: client_controls_report.json)
+```
 Controls stdout format (JSON file is still written)
-
---quiet
+```
+--output text|json (default: text)
+```
 Minimal terminal output
-
---max-items <n> (default: 20)
+```
+--quiet
+```
 Max findings printed to stdout
-
---show-html
+```
+--max-items <n> (default: 20)
+```
 Include clipped outerHTML in terminal output
-
---no-redact
+```
+--show-html
+```
 Disable secret redaction in JSON (not recommended)
+```
+--no-redact
+```
 
-DevTools / Inspection
+## DevTools / Inspection
 
---devtools
 Launch Chromium with DevTools open (requires HEADLESS=0)
-
---focus password|hidden
+```
+--devtools
+```
 Scroll to and highlight the first matching finding
-
---pause
+```
+--focus password|hidden
+```
 Keep browser open after scan
+```
+--pause
+```
 
-Timing / Safety
+## Timing / Safety
 
---wait-ms <ms> (default: 5000)
 Delay after page load (useful for SPAs)
-
---limit <n> (default: 250)
+```
+--wait-ms <ms> (default: 5000)
+```
 Cap number of DOM nodes inspected
+```
+--limit <n> (default: 250)
+```
 
-Environment
+## Environment
 
-HEADLESS=0
 Run with visible browser UI
+```
+HEADLESS=0
+```
 
-Help / Version
-
+## Help / Version
+```
 -h, --help
-
+```
+```
 -v, --version
-
-Uses / Examples
+```
+## Uses / Examples
 Basic scan (headless)
+```
 clientsideeye 'https://target/app/page'
-
+```
 Headed scan with DevTools and password focus
+```
 HEADLESS=0 clientsideeye 'https://target/app/page' \
   --devtools \
   --focus password \
   --pause
+```
 
 Authenticated scan using cookies
+```
 HEADLESS=0 clientsideeye 'https://target/app/page' \
   --header 'Cookie: .ASPXFORMSAUTH=XXX; ASP.NET_SessionId=YYY' \
   --focus hidden \
   --pause
+```
 
 Auth via Authorization header
+```
 clientsideeye 'https://target/app/page' \
   --header 'Authorization: Bearer YOUR_TOKEN'
+```
 
 Reveal hidden controls
+```
 HEADLESS=0 clientsideeye 'https://target/app/page' \
   --mode soft-unhide \
   --pause
+```
 
 Aggressive reveal (enable disabled controls)
+```
 HEADLESS=0 clientsideeye 'https://target/app/page' \
   --mode aggressive \
   --pause
+```
 
 JSON output to stdout
+```
 clientsideeye 'https://target/app/page' --output json
+```
 
-Notes on Findings
+## Notes on Findings
 
 Hidden UI ≠ vulnerability by itself
 ClientSideEye highlights UI-based restrictions that should be validated with server-side authorization testing.
@@ -178,7 +208,7 @@ Secrets present in the DOM or client-side state can often be extracted by low-pr
 
 Always confirm impact using server-side testing (e.g., Burp, manual requests).
 
-Responsible Use
+## Responsible Use
 
 ClientSideEye is intended for authorized security testing only.
 You are responsible for ensuring you have permission to assess any target.
