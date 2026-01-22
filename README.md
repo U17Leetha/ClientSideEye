@@ -26,6 +26,7 @@ cd ClientSideEye
 npm install
 npx playwright install chromium
 npm link
+'''
 
 ## Options
 
