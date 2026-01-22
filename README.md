@@ -21,7 +21,7 @@ It generates:
 
 ### Clone & setup
 ```bash
-git clone https://github.com/YOURNAME/ClientSideEye.git
+git clone https://github.com/U17Leetha/ClientSideEye.git
 cd ClientSideEye
 npm install
 npx playwright install chromium
