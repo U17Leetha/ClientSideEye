@@ -24,23 +24,23 @@ Node.js 18+
 Playwright (Chromium)
 
 ## Clone & setup
-'''bash
+```bash
 git clone https://github.com/YOURNAME/ClientSideEye.git
 cd ClientSideEye
 npm install
 npx playwright install chromium
-'''
+```
 ## Make the CLI available
 
 Option A – Local development (recommended)
-'''bash
+```bash
 npm link
-'''
+```
 
 Option B – Run directly
-'''bash
+```bash
 node src/clientsideeye.mjs --help
-'''
+```
 CLI Options
 Synopsis
 clientsideeye <url> [options]
