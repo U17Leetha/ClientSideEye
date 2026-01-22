@@ -1,0 +1,28 @@
+{
+  "name": "clientsideeye",
+  "version": "0.1.0",
+  "description": "Client-side control auditing tool for authorized web app pentesting (hidden controls, masked passwords, role/permission hints).",
+  "type": "module",
+  "bin": {
+    "clientsideeye": "bin/clientsideeye"
+  },
+  "scripts": {
+    "start": "node src/clientsideeye.mjs --help",
+    "lint": "node -c src/clientsideeye.mjs || true"
+  },
+  "keywords": [
+    "pentest",
+    "security",
+    "web",
+    "client-side",
+    "authorization",
+    "playwright"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "playwright": "^1.50.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
