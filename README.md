@@ -1,4 +1,4 @@
-ClientSideEye
+# ClientSideEye
 
 ClientSideEye is a Playwright-based CLI for authorized web application security testing focused on identifying client-side control weaknesses, including:
 
@@ -16,30 +16,31 @@ A human-readable terminal summary for fast triage
 
 ⚠️ Authorized testing only. Do not use against systems you do not own or explicitly have permission to assess.
 
-Install
+## Install
 Requirements
 
 Node.js 18+
 
 Playwright (Chromium)
 
-Clone & setup
+## Clone & setup
+'''bash
 git clone https://github.com/YOURNAME/ClientSideEye.git
 cd ClientSideEye
 npm install
 npx playwright install chromium
-
-Make the CLI available
+'''
+## Make the CLI available
 
 Option A – Local development (recommended)
-
+'''bash
 npm link
-
+'''
 
 Option B – Run directly
-
+'''bash
 node src/clientsideeye.mjs --help
-
+'''
 CLI Options
 Synopsis
 clientsideeye <url> [options]
