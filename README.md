@@ -10,14 +10,18 @@ such as hidden/disabled privileged controls and passwords rendered in HTML respo
    - Burp `Extensions -> Installed -> Add` (Java), select built JAR
 2. Confirm Burp output shows:
    - `[ClientSideEye] Browser bridge listening on http://127.0.0.1:<port> ...`
+   - `[ClientSideEye] Browser bridge token: <token>`
 3. Load unpacked browser bridge extension from:
    - `browser-extension/clientsideeye-bridge/`
-4. Open target page, click browser extension button:
+4. In the Burp `ClientSideEye` tab, copy the displayed **Bridge Token**
+5. Paste the token into the browser extension popup and click **Save Bridge Token**
+6. Open target page, click browser extension button:
    - `Scan Current Tab + Send to ClientSideEye`
-5. In popup, confirm:
+   - or `Watch DOM For 15s + Send` for SPA/runtime changes
+7. In popup, confirm:
    - `Bridge: http://127.0.0.1:<port>`
    - `Sent: <n>`
-6. Open Burp `ClientSideEye` tab and triage findings.
+8. Open Burp `ClientSideEye` tab and triage findings.
 
 ## Browser Extension Setup
 
@@ -34,6 +38,8 @@ The popup should show:
 - `Bridge: http://127.0.0.1:<port>`
 - `Sent: <n>`
 
+The popup now requires a per-session **Bridge Token** from the Burp extension tab.
+
 ## Features
 - Detects plaintext password values in HTML
 - Identifies hidden/disabled actionable UI controls
@@ -41,9 +47,15 @@ The popup should show:
 - Highlights high-risk issues in the UI
 - Provides browser-friendly “find hints” for rapid validation
 - Detects common DevTools blocking/detection logic and provides a bypass snippet
+- Scans JavaScript for endpoint references, DOM XSS sinks, and postMessage usage
+- Detects source map references and analyzes exposed `.js.map` responses
+- Extracts runtime signals from the browser extension including storage tokens and inline script indicators
+- Enumerates runtime network/API references from the browser using `performance` resource data
 - Exports findings as JSON
 - Analyzes in-scope Site Map traffic
 - Accepts runtime DOM findings via localhost Browser Bridge (for SPA/hash-route pages)
+- Uses parsed HTML analysis via jsoup rather than regex-only tag matching
+- Supports live search, host-scoped Site Map scans, and export of visible rows only
 
 ## Installation
 
@@ -76,6 +88,13 @@ The popup should show:
 4. Triage findings by Severity and Confidence
 <img width="1501" height="855" alt="image" src="https://github.com/user-attachments/assets/e3b67ed3-7893-4cf0-84a0-a0c50a0b4a99" />
 
+Notes:
+- `Host filter` now also scopes Site Map scans when set.
+- `Search` filters across title, type, URL, evidence, and finding identity.
+- `Export visible rows only` exports the currently filtered set rather than the entire store.
+- Site Map and right-click analysis now inspect both HTML responses and JavaScript assets when they look analyzable.
+- JavaScript assets with `sourceMappingURL` comments and exposed `.js.map` responses are analyzed for extra client-side attack surface.
+
 5. Use View in Browser to validate findings
 <img width="901" height="553" alt="image" src="https://github.com/user-attachments/assets/8ecc53e8-7bb3-4c67-b7cb-1c46e8870c54" />
 ### Validating Findings in the Browser
@@ -84,7 +103,7 @@ For each finding, ClientSideEye provides browser-friendly **Find Hints** to help
 
 1. Select a finding in the **ClientSideEye** tab.
 2. Click **View in Browser…**.
-3. Click **Copy selected Find Hint**.
+3. Click **Find Hint** (copies the selected hint to your clipboard).
 4. Paste the hint into your browser’s DevTools:
    - **Firefox**: Paste into the **Console** (recommended) or use it as a text search in the **Inspector**.
    - **Chrome/Chromium**: Paste into the **Console** or use it directly in the **Elements** search.
@@ -97,17 +116,26 @@ The Inspector will jump directly to the relevant element, allowing you to:
 Notes:
 - Find Hints now prefer `data-testid` when present (before generated IDs).
 - Reveal snippet removes common disabled controls (`disabled`, `aria-disabled`, `pf-m-disabled`, `is-disabled`, `btn-disabled`).
+- Highlight snippet also temporarily un-hides any hidden *ancestor* container so the outline is
+  actually visible, without changing the target control's own disabled/hidden state.
 
 ## Finding Types
 
 - PASSWORD_VALUE_IN_DOM
-
 - HIDDEN_OR_DISABLED_CONTROL
-
 - ROLE_PERMISSION_HINT
-
 - INLINE_SCRIPT_SECRETISH
 - DEVTOOLS_BLOCKING
+- JAVASCRIPT_ENDPOINT_REFERENCE
+- DOM_XSS_SINK (including framework-specific sinks: `dangerouslySetInnerHTML`, Angular `[innerHTML]`/`bypassSecurityTrust*`, Vue `v-html`)
+- POSTMESSAGE_HANDLER
+- STORAGE_TOKEN (Browser Bridge only)
+- SOURCE_MAP_DISCLOSURE
+- RUNTIME_NETWORK_REFERENCE (hard-coded `WebSocket`/`EventSource` endpoints, plus Browser Bridge runtime resource data)
+- PROTOTYPE_POLLUTION_HINT (`__proto__` access, unguarded `merge`/`extend`/`Object.assign` of parsed data)
+
+All finding types above are produced by both the Java-side Site Map/right-click analysis and the
+Browser Bridge's runtime scanner - the two paths have full parity.
 
 ## Browser Bridge (for Runtime DOM Findings)
 
@@ -122,6 +150,7 @@ Bridge port behavior:
 - Default port is `17373`.
 - If busy, ClientSideEye automatically tries `17374` to `17382`.
 - Active port is logged in Burp extension output.
+- A per-session bridge token is generated on startup and shown in the Burp tab/output.
 
 ### POST format
 
@@ -167,6 +196,51 @@ A starter Chromium extension is included at:
 
 It scans the current tab for actionable disabled/hidden controls and posts findings to the local bridge.
 
+The popup also provides `Watch DOM For 15s + Send`, which repeatedly snapshots the active tab to catch SPA route changes and delayed rendering.
+
+Runtime browser collection now also looks for:
+
+- token- or secret-like values in `localStorage` / `sessionStorage`
+- endpoint references in inline/runtime scripts
+- dangerous DOM/code-execution sinks such as `innerHTML` and `eval` (including framework-specific
+  sinks like React `dangerouslySetInnerHTML`, Angular `[innerHTML]`/`bypassSecurityTrust*`, and
+  Vue `v-html`)
+- `postMessage` usage patterns
+- runtime network/API requests referenced by `fetch`, XHR, scripts, and other observed resources
+- role/permission hints, secret-like inline script values, DevTools blocking/detection logic,
+  hard-coded `WebSocket`/`EventSource` endpoints, and prototype-pollution patterns
+
+### Fetching external scripts and source maps
+
+Externally-loaded `<script src="...">` tags never expose their body through the DOM
+(`textContent` is empty for them), so the browser scanner fetches a bounded number of them
+itself (up to 5 per scan, 1.5s timeout each, ~400KB size cap) to analyze their content the same
+way as inline `<script>` bodies. If a fetched script references a source map
+(`//# sourceMappingURL=...`), the scanner also fetches that map (up to 3 per scan, same bounds),
+parses it, and recursively analyzes any embedded original source in `sourcesContent` - source
+maps frequently contain the full unminified original code, which can surface findings that are
+much harder to spot in the shipped minified bundle.
+
+These fetches:
+- are issued from the **page's own context** (same-origin, using the page's own
+  cookies/permissions, exactly like the page's own JavaScript would), not from the extension's
+  privileged context - no additional `host_permissions` are required.
+- fail silently and are skipped (never abort the rest of the scan) on network errors, CORS
+  blocks, timeouts, or oversized responses.
+- are the only outbound network activity this browser extension performs beyond talking to the
+  local ClientSideEye bridge - no fetch ever leaves the current page's own origin/network path.
+
+## Security Model
+
+The Browser Bridge is intentionally bound to `127.0.0.1` only.
+
+To reduce the risk of arbitrary web pages injecting spoofed findings into Burp:
+
+- `POST /api/finding` requires a per-session bridge token
+- CORS is only granted to browser extension origins
+- request bodies are size-limited
+- bridge sockets use read timeouts and worker handling to avoid a single stalled client blocking the bridge
+
 ## SPA/Hash Route Guidance
 
 For routes like:
@@ -193,9 +267,11 @@ this is expected. Reload the browser bridge extension so it can probe the active
 
 1. Confirm Burp output includes:
    - `Browser bridge listening on http://127.0.0.1:<port> ...`
+   - `Browser bridge token: <token>`
 2. Reload browser extension after any `manifest.json` change.
-3. Re-open popup and run scan again.
-4. Check popup status for:
+3. Copy the current token from the Burp `ClientSideEye` tab into the popup and click `Save Bridge Token`.
+4. Re-open popup and run scan again.
+5. Check popup status for:
    - `Bridge: http://127.0.0.1:<port>`
    - `Sent: <n>`
 
