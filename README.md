@@ -115,9 +115,17 @@ The Inspector will jump directly to the relevant element, allowing you to:
 
 Notes:
 - Find Hints now prefer `data-testid` when present (before generated IDs).
-- Reveal snippet removes common disabled controls (`disabled`, `aria-disabled`, `pf-m-disabled`, `is-disabled`, `btn-disabled`).
+- Reveal snippet clears disabled/hidden state generically rather than targeting one framework:
+  it removes `disabled`/`aria-disabled`/`hidden` attributes, strips any CSS class whose name
+  matches a disabled/hidden naming pattern (covers Bootstrap, PatternFly, Ant Design, Material
+  UI, Bulma, and hand-rolled conventions), overrides `display`/`visibility`/`opacity`/
+  `pointer-events` with `!important` so it also beats `!important` utility classes (e.g.
+  Bootstrap's `.d-none`/`.invisible`), and switches matched `<input type="password">` fields to
+  `type="text"` so the plaintext value becomes visible.
 - Highlight snippet also temporarily un-hides any hidden *ancestor* container so the outline is
   actually visible, without changing the target control's own disabled/hidden state.
+- In "View in Browser...", the Highlight/Reveal/DevTools-bypass action rows are visually grouped
+  together below a divider, with a specific tooltip on each button describing what it does.
 
 ## Finding Types
 
