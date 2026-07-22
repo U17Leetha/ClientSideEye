@@ -18,17 +18,51 @@
                 width: 340px;
             }
             button {
+                display: block;
                 width: 100%;
-                padding: 8px 10px;
+                padding: 10px 12px;
+                margin-top: 12px;
                 border: 0;
                 background: #1f6feb;
                 color: #fff;
                 border-radius: 6px;
                 cursor: pointer;
+                font-weight: 600;
+                font-size: 13px;
+            }
+            button:hover:not(:disabled) {
+                background: #1a5fd0;
             }
             button:disabled {
                 background: #6e7781;
                 cursor: not-allowed;
+            }
+            #saveToken {
+                background: #57606a;
+            }
+            #saveToken:hover:not(:disabled) {
+                background: #444c56;
+            }
+            .actions {
+                margin-top: 16px;
+                padding-top: 14px;
+                border-top: 1px solid #d0d7de;
+            }
+            .actions button + button {
+                margin-top: 10px;
+            }
+            label {
+                display: block;
+                margin-top: 10px;
+                font-weight: 600;
+            }
+            input {
+                width: 100%;
+                box-sizing: border-box;
+                margin-top: 4px;
+                padding: 8px 10px;
+                border: 1px solid #d0d7de;
+                border-radius: 6px;
             }
             #status {
                 margin-top: 10px;
@@ -42,11 +76,24 @@
         </style>
     </head>
     <body>
-        <button id="scanSend">Scan Current Tab + Send to ClientSideEye</button>
+        <label for="bridgeToken">Bridge token</label>
+        <input
+            id="bridgeToken"
+            type="password"
+            placeholder="Paste token from Burp ClientSideEye tab"
+            autocomplete="off"
+            spellcheck="false"
+        />
+        <button id="saveToken">Save Bridge Token</button>
+        <div class="actions">
+            <button id="scanSend">Scan Current Tab + Send to ClientSideEye</button>
+            <button id="watchSend">Watch DOM For 15s + Send</button>
+        </div>
         <div id="status">Idle</div>
         <div class="muted">
             Bridge endpoint: auto-detects
-            http://127.0.0.1:17373-17382/api/finding
+            http://127.0.0.1:17373-17382/api/finding. The Burp extension now
+            requires a per-session bridge token.
         </div>
         <script src="popup.js"></script>
     </body>
