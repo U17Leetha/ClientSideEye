@@ -3,7 +3,7 @@ plugins {
 }
 
 group = 'com.clientsideeye'
-version = '0.1.0'
+version = '0.2.0'
 
 repositories {
     mavenCentral()
@@ -11,8 +11,12 @@ repositories {
 
 dependencies {
     // BApp-friendly: compile against public Montoya API (Burp provides it at runtime)
-    compileOnly "net.portswigger.burp.extensions:montoya-api:2025.12"
+    compileOnly "net.portswigger.burp.extensions:montoya-api:2026.7"
+    implementation "org.jsoup:jsoup:1.22.2"
     testImplementation "org.junit.jupiter:junit-jupiter:5.10.2"
+    testRuntimeOnly "org.junit.platform:junit-platform-launcher"
+    testImplementation "org.mockito:mockito-core:5.14.2"
+    testImplementation "net.portswigger.burp.extensions:montoya-api:2026.7"
 }
 
 java {
@@ -31,6 +35,10 @@ test {
 
 jar {
     archiveBaseName = "ClientSideEye-Burp"
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    from {
+        configurations.runtimeClasspath.collect { it.isDirectory() ? it : zipTree(it) }
+    }
     manifest {
         attributes(
             "Main-Class": "com.clientsideeye.burp.ClientSideEyeExtension"
