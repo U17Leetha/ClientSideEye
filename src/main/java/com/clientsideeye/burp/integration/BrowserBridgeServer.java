@@ -18,21 +18,28 @@ import java.net.URI;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.security.SecureRandom;
 
 public final class BrowserBridgeServer {
     private static final String HOST = "127.0.0.1";
     private static final int PORT = 17373;
     private static final int MAX_PORT_ATTEMPTS = 10;
+    private static final int SOCKET_READ_TIMEOUT_MS = 5000;
+    private static final int MAX_FORM_BODY_BYTES = 64 * 1024;
+    private static final String TOKEN_HEADER = "x-clientsideeye-token";
 
     private final MontoyaApi api;
     private final ClientSideEyeTab tab;
-    private final ExecutorService exec;
+    private final ExecutorService acceptExec;
+    private final ExecutorService clientExec;
+    private final String authToken;
     private volatile boolean running;
     private ServerSocket serverSocket;
     private int boundPort = -1;
@@ -40,11 +47,17 @@ public final class BrowserBridgeServer {
     public BrowserBridgeServer(MontoyaApi api, ClientSideEyeTab tab) {
         this.api = api;
         this.tab = tab;
-        this.exec = Executors.newSingleThreadExecutor(r -> {
+        this.acceptExec = Executors.newSingleThreadExecutor(r -> {
             Thread t = new Thread(r, "ClientSideEye-bridge");
             t.setDaemon(true);
             return t;
         });
+        this.clientExec = Executors.newCachedThreadPool(r -> {
+            Thread t = new Thread(r, "ClientSideEye-bridge-client");
+            t.setDaemon(true);
+            return t;
+        });
+        this.authToken = generateToken();
     }
 
     public synchronized void start() {
@@ -59,8 +72,9 @@ public final class BrowserBridgeServer {
                 serverSocket.setSoTimeout(1000);
                 boundPort = candidatePort;
                 running = true;
-                exec.submit(this::acceptLoop);
+                acceptExec.submit(this::acceptLoop);
                 api.logging().logToOutput("[ClientSideEye] Browser bridge listening on http://" + HOST + ":" + boundPort + " (/api/health, /api/finding)");
+                api.logging().logToOutput("[ClientSideEye] Browser bridge token: " + authToken);
                 if (boundPort != PORT) {
                     api.logging().logToOutput("[ClientSideEye] Default port " + PORT + " was busy. Using fallback port " + boundPort + ".");
                 }
@@ -87,14 +101,16 @@ public final class BrowserBridgeServer {
         } finally {
             serverSocket = null;
         }
-        exec.shutdownNow();
+        acceptExec.shutdownNow();
+        clientExec.shutdownNow();
     }
 
     private void acceptLoop() {
         while (running) {
             try {
                 Socket s = serverSocket.accept();
-                handleClient(s);
+                s.setSoTimeout(SOCKET_READ_TIMEOUT_MS);
+                clientExec.submit(() -> handleClient(s));
             } catch (SocketTimeoutException ignored) {
                 // periodic loop check
             } catch (Exception e) {
@@ -105,20 +121,29 @@ public final class BrowserBridgeServer {
         }
     }
 
+    private static final int MAX_LINE_BYTES = 8 * 1024;
+    private static final int MAX_HEADER_COUNT = 100;
+
     private void handleClient(Socket socket) {
         try (socket;
              BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8));
              BufferedWriter out = new BufferedWriter(new OutputStreamWriter(socket.getOutputStream(), StandardCharsets.UTF_8))) {
 
-            String requestLine = in.readLine();
+            String requestLine;
+            try {
+                requestLine = readBoundedLine(in, MAX_LINE_BYTES);
+            } catch (IOException tooLong) {
+                writeResponse(out, 431, "application/json; charset=utf-8", "{\"error\":\"line too long\"}", null);
+                return;
+            }
             if (requestLine == null || requestLine.isBlank()) {
-                writeResponse(out, 400, "application/json; charset=utf-8", "{\"error\":\"bad request\"}");
+                writeResponse(out, 400, "application/json; charset=utf-8", "{\"error\":\"bad request\"}", null);
                 return;
             }
 
             String[] reqParts = requestLine.split(" ");
             if (reqParts.length < 2) {
-                writeResponse(out, 400, "application/json; charset=utf-8", "{\"error\":\"bad request\"}");
+                writeResponse(out, 400, "application/json; charset=utf-8", "{\"error\":\"bad request\"}", null);
                 return;
             }
             String method = reqParts[0].trim().toUpperCase(Locale.ROOT);
@@ -130,9 +155,32 @@ public final class BrowserBridgeServer {
             }
 
             int contentLength = 0;
+            String origin = null;
+            Map<String, String> headers = new HashMap<>();
             String line;
-            while ((line = in.readLine()) != null && !line.isEmpty()) {
+            int headerCount = 0;
+            while (true) {
+                try {
+                    line = readBoundedLine(in, MAX_LINE_BYTES);
+                } catch (IOException tooLong) {
+                    writeResponse(out, 431, "application/json; charset=utf-8", "{\"error\":\"header too long\"}", null);
+                    return;
+                }
+                if (line == null || line.isEmpty()) break;
+                if (++headerCount > MAX_HEADER_COUNT) {
+                    writeResponse(out, 431, "application/json; charset=utf-8", "{\"error\":\"too many headers\"}", null);
+                    return;
+                }
                 String lower = line.toLowerCase(Locale.ROOT);
+                int colon = line.indexOf(':');
+                if (colon > 0) {
+                    String headerName = line.substring(0, colon).trim().toLowerCase(Locale.ROOT);
+                    String headerValue = line.substring(colon + 1).trim();
+                    headers.put(headerName, headerValue);
+                    if ("origin".equals(headerName)) {
+                        origin = headerValue;
+                    }
+                }
                 if (lower.startsWith("content-length:")) {
                     try {
                         contentLength = Integer.parseInt(line.substring("content-length:".length()).trim());
@@ -140,6 +188,11 @@ public final class BrowserBridgeServer {
                         contentLength = 0;
                     }
                 }
+            }
+
+            if (contentLength > MAX_FORM_BODY_BYTES) {
+                writeResponse(out, 413, "application/json; charset=utf-8", "{\"error\":\"request too large\"}", origin);
+                return;
             }
 
             String body = "";
@@ -155,39 +208,46 @@ public final class BrowserBridgeServer {
             }
 
             if ("OPTIONS".equals(method)) {
-                writeResponse(out, 204, "text/plain; charset=utf-8", "");
+                writeResponse(out, 204, "text/plain; charset=utf-8", "", origin);
                 return;
             }
 
             if ("/api/health".equals(path)) {
                 if (!"GET".equals(method)) {
-                    writeResponse(out, 405, "application/json; charset=utf-8", "{\"error\":\"method not allowed\"}");
+                    writeResponse(out, 405, "application/json; charset=utf-8", "{\"error\":\"method not allowed\"}", origin);
                     return;
                 }
-                writeResponse(out, 200, "application/json; charset=utf-8", "{\"status\":\"ok\"}");
+                writeResponse(out, 200, "application/json; charset=utf-8", "{\"status\":\"ok\",\"authRequired\":true}", origin);
                 return;
             }
 
             if ("/api/finding".equals(path)) {
                 if (!"POST".equals(method)) {
-                    writeResponse(out, 405, "application/json; charset=utf-8", "{\"error\":\"method not allowed\"}");
+                    writeResponse(out, 405, "application/json; charset=utf-8", "{\"error\":\"method not allowed\"}", origin);
                     return;
                 }
-                handleFindingPost(out, body);
+                String providedToken = safe(headers.get(TOKEN_HEADER));
+                int validationStatus = validateFindingRequest(authToken, providedToken, contentLength);
+                if (validationStatus != 200) {
+                    String bodyText = validationStatus == 401 ? "{\"error\":\"unauthorized\"}" : "{\"error\":\"request too large\"}";
+                    writeResponse(out, validationStatus, "application/json; charset=utf-8", bodyText, origin);
+                    return;
+                }
+                handleFindingPost(out, body, origin);
                 return;
             }
 
-            writeResponse(out, 404, "application/json; charset=utf-8", "{\"error\":\"not found\"}");
+            writeResponse(out, 404, "application/json; charset=utf-8", "{\"error\":\"not found\"}", origin);
         } catch (Exception e) {
             api.logging().logToError("[ClientSideEye] Bridge client error: " + e);
         }
     }
 
-    private void handleFindingPost(BufferedWriter out, String body) throws IOException {
+    private void handleFindingPost(BufferedWriter out, String body, String origin) throws IOException {
         Map<String, String> form = parseFormEncoded(body);
         String url = safe(form.get("url"));
         if (url.isBlank()) {
-            writeResponse(out, 400, "application/json; charset=utf-8", "{\"error\":\"url is required\"}");
+            writeResponse(out, 400, "application/json; charset=utf-8", "{\"error\":\"url is required\"}", origin);
             return;
         }
 
@@ -201,6 +261,7 @@ public final class BrowserBridgeServer {
         String recommendation = defaultIfBlank(form.get("recommendation"),
                 "Validate server-side authorization for this action. Do not rely on client-side disabled/hidden states.");
         String host = hostFromUrl(url);
+        String identity = defaultIfBlank(form.get("identity"), type + "|" + Integer.toHexString(evidence.hashCode()));
 
         Finding finding = new Finding(
                 type,
@@ -211,7 +272,8 @@ public final class BrowserBridgeServer {
                 title,
                 summary,
                 evidence,
-                recommendation
+                recommendation,
+                identity
         );
 
         List<Finding> findings = new ArrayList<>();
@@ -220,31 +282,67 @@ public final class BrowserBridgeServer {
 
         String source = defaultIfBlank(form.get("source"), "browser-extension");
         api.logging().logToOutput("[ClientSideEye] Bridge accepted finding from " + source + " | " + type + " | " + severity + " (" + confidence + ") | " + url);
-        writeResponse(out, 200, "application/json; charset=utf-8", "{\"accepted\":1}");
+        writeResponse(out, 200, "application/json; charset=utf-8", "{\"accepted\":1}", origin);
     }
 
-    private static void writeResponse(BufferedWriter out, int status, String contentType, String body) throws IOException {
+    private static void writeResponse(BufferedWriter out, int status, String contentType, String body, String origin) throws IOException {
         String statusText = switch (status) {
             case 200 -> "OK";
             case 204 -> "No Content";
+            case 401 -> "Unauthorized";
+            case 413 -> "Payload Too Large";
             case 400 -> "Bad Request";
             case 404 -> "Not Found";
             case 405 -> "Method Not Allowed";
+            case 431 -> "Request Header Fields Too Large";
             default -> "Error";
         };
         byte[] bodyBytes = body == null ? new byte[0] : body.getBytes(StandardCharsets.UTF_8);
         out.write("HTTP/1.1 " + status + " " + statusText + "\r\n");
         out.write("Content-Type: " + contentType + "\r\n");
         out.write("Content-Length: " + bodyBytes.length + "\r\n");
-        out.write("Access-Control-Allow-Origin: *\r\n");
-        out.write("Access-Control-Allow-Methods: GET,POST,OPTIONS\r\n");
-        out.write("Access-Control-Allow-Headers: Content-Type\r\n");
+        if (isAllowedExtensionOrigin(origin)) {
+            out.write("Access-Control-Allow-Origin: " + origin + "\r\n");
+            out.write("Vary: Origin\r\n");
+            out.write("Access-Control-Allow-Methods: GET,POST,OPTIONS\r\n");
+            out.write("Access-Control-Allow-Headers: Content-Type, X-ClientSideEye-Token\r\n");
+        }
         out.write("Connection: close\r\n");
         out.write("\r\n");
         if (bodyBytes.length > 0) {
             out.write(new String(bodyBytes, StandardCharsets.UTF_8));
         }
         out.flush();
+    }
+
+    private static boolean isAllowedExtensionOrigin(String origin) {
+        if (origin == null || origin.isBlank()) return false;
+        return origin.startsWith("chrome-extension://")
+                || origin.startsWith("moz-extension://")
+                || origin.startsWith("safari-web-extension://");
+    }
+
+    static int validateFindingRequest(String expectedToken, String providedToken, int contentLength) {
+        if (contentLength > MAX_FORM_BODY_BYTES) return 413;
+        if (!safe(expectedToken).equals(safe(providedToken))) return 401;
+        return 200;
+    }
+
+    private static String readBoundedLine(BufferedReader in, int maxLen) throws IOException {
+        StringBuilder sb = new StringBuilder();
+        int ch;
+        while ((ch = in.read()) != -1) {
+            if (ch == '\n') {
+                int len = sb.length();
+                if (len > 0 && sb.charAt(len - 1) == '\r') sb.setLength(len - 1);
+                return sb.toString();
+            }
+            if (sb.length() >= maxLen) {
+                throw new IOException("line exceeds maximum length of " + maxLen);
+            }
+            sb.append((char) ch);
+        }
+        return sb.length() == 0 ? null : sb.toString();
     }
 
     private static Map<String, String> parseFormEncoded(String body) {
@@ -305,5 +403,19 @@ public final class BrowserBridgeServer {
         } catch (Exception e) {
             return "";
         }
+    }
+
+    private static String generateToken() {
+        byte[] bytes = new byte[24];
+        new SecureRandom().nextBytes(bytes);
+        return Base64.getUrlEncoder().withoutPadding().encodeToString(bytes);
+    }
+
+    public int boundPort() {
+        return boundPort;
+    }
+
+    public String authToken() {
+        return authToken;
     }
 }

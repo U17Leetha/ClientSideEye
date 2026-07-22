@@ -26,6 +26,7 @@ public final class JsonExporter {
             kv(sb, "url", f.url()); sb.append(",");
             kv(sb, "host", f.host()); sb.append(",");
             kv(sb, "title", f.title()); sb.append(",");
+            kv(sb, "identity", f.identity()); sb.append(",");
             kv(sb, "firstSeen", f.firstSeen()); sb.append(",");
             kv(sb, "summary", f.summary()); sb.append(",");
             kv(sb, "evidence", f.evidence()); sb.append(",");

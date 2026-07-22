@@ -8,6 +8,8 @@ import burp.api.montoya.ui.contextmenu.ContextMenuItemsProvider;
 
 import com.clientsideeye.burp.core.Finding;
 import com.clientsideeye.burp.core.HtmlAnalyzer;
+import com.clientsideeye.burp.core.JavaScriptAnalyzer;
+import com.clientsideeye.burp.core.SourceMapAnalyzer;
 import com.clientsideeye.burp.integration.BrowserBridgeServer;
 import com.clientsideeye.burp.ui.ClientSideEyeTab;
 
@@ -41,6 +43,7 @@ public class ClientSideEyeExtension implements BurpExtension {
         api.userInterface().registerSuiteTab("ClientSideEye", tab);
         this.bridgeServer = new BrowserBridgeServer(api, tab);
         this.bridgeServer.start();
+        this.tab.setBridgeConnectionInfo(this.bridgeServer.boundPort(), this.bridgeServer.authToken());
         api.extension().registerUnloadingHandler(() -> {
             try {
                 if (bridgeServer != null) bridgeServer.stop();
@@ -82,7 +85,7 @@ public class ClientSideEyeExtension implements BurpExtension {
             }
             List<HttpRequestResponse> snapshot = new ArrayList<>(selected);
 
-            JMenuItem item = new JMenuItem("Send to ClientSideEye (analyze response HTML)");
+            JMenuItem item = new JMenuItem("Send to ClientSideEye (analyze response HTML/JS)");
             item.addActionListener(e -> bg.submit(() -> analyzeSelection(snapshot)));
 
             JMenu menu = new JMenu("ClientSideEye");
@@ -98,6 +101,8 @@ public class ClientSideEyeExtension implements BurpExtension {
                 int skippedMissingResponse = 0;
                 int skippedEmptyBody = 0;
                 int skippedNonHtml = 0;
+                int failedItems = 0;
+                List<Finding> batch = new ArrayList<>();
 
                 for (HttpRequestResponse rr : selected) {
                     if (rr == null || rr.request() == null || rr.response() == null) {
@@ -105,23 +110,40 @@ public class ClientSideEyeExtension implements BurpExtension {
                         continue;
                     }
 
+                    try {
                     String url = rr.request().url();
                     String body = rr.response().bodyToString();
                     if (body == null || body.isBlank()) {
                         skippedEmptyBody++;
                         continue;
                     }
-                    if (!HtmlAnalyzer.looksLikeHtmlForAnalysis(url, body)) {
+                    boolean htmlLike = HtmlAnalyzer.looksLikeHtmlForAnalysis(url, body);
+                    boolean jsLike = JavaScriptAnalyzer.looksLikeJavaScriptForAnalysis(url, body);
+                    boolean sourceMapLike = SourceMapAnalyzer.looksLikeSourceMap(url, body);
+                    if (!htmlLike && !jsLike && !sourceMapLike) {
                         skippedNonHtml++;
                         continue;
                     }
 
                     analyzed++;
-                    List<Finding> findings = HtmlAnalyzer.analyzeHtml(url, body);
+                    List<Finding> findings = new ArrayList<>();
+                    if (htmlLike) findings.addAll(HtmlAnalyzer.analyzeHtml(url, body));
+                    if (jsLike) {
+                        findings.addAll(JavaScriptAnalyzer.analyzeJavaScript(url, body));
+                        findings.addAll(SourceMapAnalyzer.analyzeSourceMappingReference(url, body));
+                    }
+                    if (sourceMapLike) findings.addAll(SourceMapAnalyzer.analyzeSourceMap(url, body));
                     if (!findings.isEmpty()) {
-                        tab.addFindings(findings);
+                        batch.addAll(findings);
                         added += findings.size();
                     }
+                    } catch (Exception itemError) {
+                        failedItems++;
+                        api.logging().logToError("[ClientSideEye] Right-click analyze: skipped one item due to error: " + itemError);
+                    }
+                }
+                if (!batch.isEmpty()) {
+                    tab.addFindings(batch);
                 }
 
                 api.logging().logToOutput(
@@ -130,7 +152,8 @@ public class ClientSideEyeExtension implements BurpExtension {
                                 + " | Findings added: " + added
                                 + " | Skipped (no response): " + skippedMissingResponse
                                 + " | Skipped (empty body): " + skippedEmptyBody
-                                + " | Skipped (non-HTML): " + skippedNonHtml
+                                + " | Skipped (non-HTML/JS): " + skippedNonHtml
+                                + " | Failed items: " + failedItems
                 );
             } catch (Exception ex) {
                 api.logging().logToError("[ClientSideEye] Right-click analyze error: " + ex);

@@ -19,6 +19,7 @@ public final class Finding {
     private final String summary;
     private final String evidence;
     private final String recommendation;
+    private final String identity;
     private final String firstSeen;     // ISO-ish string
 
     public Finding(
@@ -32,7 +33,7 @@ public final class Finding {
             String evidence,
             String recommendation
     ) {
-        this(type, severity, confidence, url, host, title, summary, evidence, recommendation, Instant.now().toString());
+        this(type, severity, confidence, url, host, title, summary, evidence, recommendation, "", Instant.now().toString());
     }
 
     public Finding(
@@ -45,6 +46,22 @@ public final class Finding {
             String summary,
             String evidence,
             String recommendation,
+            String identity
+    ) {
+        this(type, severity, confidence, url, host, title, summary, evidence, recommendation, identity, Instant.now().toString());
+    }
+
+    public Finding(
+            String type,
+            Severity severity,
+            int confidence,
+            String url,
+            String host,
+            String title,
+            String summary,
+            String evidence,
+            String recommendation,
+            String identity,
             String firstSeen
     ) {
         this.type = Objects.requireNonNull(type, "type");
@@ -57,6 +74,7 @@ public final class Finding {
         this.summary = safe(summary);
         this.evidence = safe(evidence);
         this.recommendation = safe(recommendation);
+        this.identity = safe(identity);
         this.firstSeen = safe(firstSeen);
     }
 
@@ -68,6 +86,7 @@ public final class Finding {
     public String summary() { return summary; }
     public String evidence() { return evidence; }
     public String recommendation() { return recommendation; }
+    public String identity() { return identity; }
     public String firstSeen() { return firstSeen; }
 
     // --- new ---
@@ -76,9 +95,12 @@ public final class Finding {
 
     // Stable dedupe key (type+url+evidence signature)
     public String stableKey() {
-        String ev = evidence;
-        if (ev.length() > 200) ev = ev.substring(0, 200);
-        return type + "|" + url + "|" + Integer.toHexString(ev.hashCode());
+        String basis = identity;
+        if (basis.isBlank()) {
+            basis = title + "|" + evidence;
+        }
+        if (basis.length() > 400) basis = basis.substring(0, 400);
+        return type + "|" + url + "|" + Integer.toHexString(basis.hashCode());
     }
 
     private static int clamp(int v, int lo, int hi) {
