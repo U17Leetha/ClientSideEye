@@ -41,6 +41,9 @@ public final class JsonExporter {
         sb.append("\"").append(esc(k)).append("\":\"").append(esc(v)).append("\"");
     }
 
+    // Hand-rolled escaping is deliberate: Gson is bundled for other uses, but this exporter's
+    // output is a stable machine-readable schema (control chars escaped, fixed key order) that
+    // downstream scripts diff — changing serializers would churn every export.
     private static String esc(String s) {
         if (s == null) return "";
         StringBuilder out = new StringBuilder(s.length() + 16);

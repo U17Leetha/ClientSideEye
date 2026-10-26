@@ -132,6 +132,13 @@ public class ClientSideEyeExtension implements BurpExtension {
                         skippedEmptyBody++;
                         continue;
                     }
+                    if (!HtmlAnalyzer.looksLikeHtmlForAnalysis(url, body)
+                            && !JavaScriptAnalyzer.looksLikeJavaScriptForAnalysis(url, body)
+                            && !SourceMapAnalyzer.looksLikeSourceMap(url, body)) {
+                        // Mirrors ResponseAnalyzer's own gating: nothing in it would match.
+                        skippedNonHtml++;
+                        continue;
+                    }
                     analyzed++;
                     List<Finding> findings = ResponseAnalyzer.analyze(url, body);
                     if (!findings.isEmpty()) {

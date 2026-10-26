@@ -128,10 +128,11 @@ public final class BrowserBridgeServer {
         while (running) {
             try {
                 Socket client = serverSocket.accept();
-                long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(SOCKET_READ_TIMEOUT_MS);
                 clients.add(client);
                 if (!running) { clients.remove(client); client.close(); break; }
-                try { clientExec.execute(() -> handleClient(client, deadline)); }
+                // Deadline starts when the handler runs, not at accept: a connection that
+                // waited in the clientExec queue has not consumed its read budget yet.
+                try { clientExec.execute(() -> handleClient(client)); }
                 catch (RejectedExecutionException full) {
                     clients.remove(client);
                     client.close();
@@ -146,7 +147,8 @@ public final class BrowserBridgeServer {
         }
     }
 
-    private void handleClient(Socket socket, long deadline) {
+    private void handleClient(Socket socket) {
+        long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(SOCKET_READ_TIMEOUT_MS);
         try (socket) {
             InputStream in = socket.getInputStream();
             OutputStream out = socket.getOutputStream();
@@ -269,7 +271,7 @@ public final class BrowserBridgeServer {
         String recommendation = defaultIfBlank(form.get("recommendation"),
                 "Validate server-side authorization for this action. Do not rely on client-side disabled/hidden states.");
         String host = hostFromUrl(url);
-        String identity = defaultIfBlank(form.get("identity"), type + "|" + Integer.toHexString(evidence.hashCode()));
+        String identity = defaultIfBlank(form.get("identity"), type + "|" + evidenceFingerprint(evidence));
 
         Finding finding = new Finding(
                 type,
@@ -287,8 +289,6 @@ public final class BrowserBridgeServer {
         List<Finding> findings = new ArrayList<>();
         findings.add(finding);
         tab.addFindings(findings);
-
-        String source = defaultIfBlank(form.get("source"), "browser-extension");
 
         writeResponse(out, 200, "application/json; charset=utf-8", "{\"accepted\":1}", origin);
     }
@@ -359,11 +359,25 @@ public final class BrowserBridgeServer {
         return FindingType.HIDDEN_OR_DISABLED_CONTROL.name();
     }
 
+    // SHA-256 prefix identity: 32-bit String.hashCode() collisions between distinct
+    // evidence strings would silently merge different findings in the tab's dedupe map.
+    private static String evidenceFingerprint(String evidence) {
+        try {
+            byte[] digest = java.security.MessageDigest.getInstance("SHA-256")
+                    .digest(evidence.getBytes(StandardCharsets.UTF_8));
+            StringBuilder sb = new StringBuilder(16);
+            for (int i = 0; i < 8; i++) sb.append(String.format("%02x", digest[i]));
+            return sb.toString();
+        } catch (java.security.NoSuchAlgorithmException impossible) {
+            throw new IllegalStateException("SHA-256 missing from JVM", impossible); // mandated by the JLS
+        }
+    }
+
     private static Finding.Severity parseSeverity(String s) {
         String x = safe(s).trim().toUpperCase(Locale.ROOT);
         try {
             return Finding.Severity.valueOf(x);
-        } catch (Exception e) {
+        } catch (IllegalArgumentException e) {
             return Finding.Severity.MEDIUM;
         }
     }
@@ -371,7 +385,7 @@ public final class BrowserBridgeServer {
     private static int parseInt(String s, int dflt) {
         try {
             return Integer.parseInt(safe(s).trim());
-        } catch (Exception e) {
+        } catch (NumberFormatException e) {
             return dflt;
         }
     }
@@ -389,7 +403,7 @@ public final class BrowserBridgeServer {
         try {
             URL u = new URL(url);
             return u.getHost() == null ? "" : u.getHost();
-        } catch (Exception e) {
+        } catch (java.net.MalformedURLException e) {
             return "";
         }
     }

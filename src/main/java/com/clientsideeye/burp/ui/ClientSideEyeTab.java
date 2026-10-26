@@ -47,7 +47,7 @@ public class ClientSideEyeTab extends JPanel {
     }
     public long resultGeneration() { return generation.get(); }
     public void cancelPendingResults() { generation.incrementAndGet(); }
-    private static final int MAX_FINDINGS = 5000;
+    private static final int MAX_TABLE_FINDINGS = 5000;
     private static final int SITE_MAP_SCAN_WARN_THRESHOLD = 1000;
     private static final int SITE_MAP_SCAN_HARD_CAP = 2000;
     // Coalesce findings from a batch scan into groups before pushing them to the table, instead
@@ -354,7 +354,7 @@ public class ClientSideEyeTab extends JPanel {
             }
 
             // cap
-            while (findingsByKey.size() > MAX_FINDINGS) {
+            while (findingsByKey.size() > MAX_TABLE_FINDINGS) {
                 String firstKey = findingsByKey.keySet().iterator().next();
                 findingsByKey.remove(firstKey);
                 falsePositiveKeys.remove(firstKey);
