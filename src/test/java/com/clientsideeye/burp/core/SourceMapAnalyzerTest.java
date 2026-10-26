@@ -33,4 +33,22 @@ class SourceMapAnalyzerTest {
         assertTrue(findings.stream().anyMatch(f ->
                 f.type().equals(FindingType.DOM_XSS_SINK.name())));
     }
+    @Test
+    void preservesNullSlotsDuplicateSourcesAndUnicode() {
+        String map = "{\"version\":3,\"sources\":[\"first.js\",\"second.js\",\"second.js\"],\"sourcesContent\":[null,\"eval(location.hash);\",\"fetch('/api/admin');\"]}";
+        var findings = SourceMapAnalyzer.analyzeSourceMap("https://example.test/a.map?q=\"><tag>", map);
+        assertTrue(findings.stream().filter(f -> f.type().equals("DOM_XSS_SINK")).allMatch(f -> f.evidence().startsWith("[source: second.js]")));
+        org.junit.jupiter.api.Assertions.assertEquals(1, findings.stream().filter(f -> f.type().equals("DOM_XSS_SINK")).count());
+        assertTrue(findings.stream().anyMatch(f -> f.identity().contains("source-index:2")));
+        assertTrue(findings.stream().allMatch(f -> f.host().equals("example.test")));
+    }
+
+    @Test
+    void rejectsMalformedAndDeepMapsWithoutPartialResults() {
+        org.junit.jupiter.api.Assertions.assertThrows(IllegalArgumentException.class,
+            () -> SourceMapAnalyzer.analyzeSourceMap("https://example.test/a.map", "{bad-json}"));
+        org.junit.jupiter.api.Assertions.assertThrows(IllegalArgumentException.class,
+            () -> SourceMapAnalyzer.analyzeSourceMap("https://example.test/a.map", "[".repeat(100) + "0" + "]".repeat(100)));
+    }
+
 }

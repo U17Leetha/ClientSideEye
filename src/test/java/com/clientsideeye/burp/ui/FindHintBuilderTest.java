@@ -181,4 +181,25 @@ class FindHintBuilderTest {
         // not just whatever happens to already be set inline.
         assertTrue(result.highlightSnippet.contains("cs.opacity === '0'"));
     }
+    @Test
+    void generatedSnippetsTreatHostileAttributesAsData() throws Exception {
+        executeSnippet(FindHintBuilder.build("<button data-testid=\"');globalThis.reviewPwned=1;//\" disabled>Run</button>").revealSnippet, "hostile");
+        executeSnippet(FindHintBuilder.build("<button data-testid=\"line&#10;break&#13;quote'\" disabled>Run</button>").revealSnippet, "hostile");
+    }
+
+    @Test
+    void textRevealMutatesOnlyOneExactMatch() throws Exception {
+        executeSnippet(FindHintBuilder.build("<button disabled>Delete User</button>").revealSnippet, "exact");
+        executeSnippet(FindHintBuilder.build("<button disabled>Delete User</button>").revealSnippet, "ambiguous");
+    }
+
+    private static void executeSnippet(String snippet, String mode) throws Exception {
+        Process child = new ProcessBuilder("node", "tests/snippet-check.cjs").redirectErrorStream(true).start();
+        String input = new com.google.gson.Gson().toJson(java.util.Map.of("snippet", snippet, "mode", mode));
+        try (var out = child.getOutputStream()) { out.write(input.getBytes(java.nio.charset.StandardCharsets.UTF_8)); }
+        assertTrue(child.waitFor(5, java.util.concurrent.TimeUnit.SECONDS), "snippet test timed out");
+        String output = new String(child.getInputStream().readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
+        assertEquals(0, child.exitValue(), output);
+    }
+
 }

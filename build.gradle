@@ -3,7 +3,7 @@ plugins {
 }
 
 group = 'com.clientsideeye'
-version = '0.2.0'
+version = '0.2.1'
 
 repositories {
     mavenCentral()
@@ -12,7 +12,8 @@ repositories {
 dependencies {
     // BApp-friendly: compile against public Montoya API (Burp provides it at runtime)
     compileOnly "net.portswigger.burp.extensions:montoya-api:2026.7"
-    implementation "org.jsoup:jsoup:1.22.2"
+    implementation "org.jsoup:jsoup:1.23.2"
+    implementation "com.google.code.gson:gson:2.13.2"
     testImplementation "org.junit.jupiter:junit-jupiter:5.10.2"
     testRuntimeOnly "org.junit.platform:junit-platform-launcher"
     testImplementation "org.mockito:mockito-core:5.14.2"
@@ -45,3 +46,26 @@ jar {
         )
     }
 }
+
+// Browser behavior is exercised, not only parsed for syntax.
+tasks.register('verifyBrowserScripts', Exec) {
+    commandLine 'node', '--test', 'tests/popup.test.cjs'
+}
+tasks.register('verifyBrowserSyntax', Exec) {
+    commandLine 'node', '--check', 'browser-extension/clientsideeye-bridge/popup.js'
+}
+check.dependsOn verifyBrowserScripts, verifyBrowserSyntax
+
+tasks.register('syncRootJar') {
+    dependsOn jar
+    inputs.file(tasks.named('jar').flatMap { it.archiveFile })
+    outputs.file(layout.projectDirectory.file('ClientSideEye-Burp.jar'))
+    doLast {
+        copy {
+            from tasks.named('jar').get().archiveFile
+            into layout.projectDirectory
+            rename { 'ClientSideEye-Burp.jar' }
+        }
+    }
+}
+jar.finalizedBy syncRootJar

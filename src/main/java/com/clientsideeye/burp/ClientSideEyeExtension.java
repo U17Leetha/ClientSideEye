@@ -7,6 +7,8 @@ import burp.api.montoya.ui.contextmenu.ContextMenuEvent;
 import burp.api.montoya.ui.contextmenu.ContextMenuItemsProvider;
 
 import com.clientsideeye.burp.core.Finding;
+import com.clientsideeye.burp.core.AnalysisLimits;
+import com.clientsideeye.burp.core.ResponseAnalyzer;
 import com.clientsideeye.burp.core.HtmlAnalyzer;
 import com.clientsideeye.burp.core.JavaScriptAnalyzer;
 import com.clientsideeye.burp.core.SourceMapAnalyzer;
@@ -33,7 +35,8 @@ public class ClientSideEyeExtension implements BurpExtension {
         this.api = api;
         api.extension().setName("ClientSideEye");
 
-        this.bg = Executors.newSingleThreadExecutor(r -> {
+        this.bg = new java.util.concurrent.ThreadPoolExecutor(1, 1, 0, java.util.concurrent.TimeUnit.SECONDS,
+            new java.util.concurrent.ArrayBlockingQueue<>(4), r -> {
             Thread t = new Thread(r, "ClientSideEye-bg");
             t.setDaemon(true);
             return t;
@@ -46,6 +49,7 @@ public class ClientSideEyeExtension implements BurpExtension {
         this.tab.setBridgeConnectionInfo(this.bridgeServer.boundPort(), this.bridgeServer.authToken());
         api.extension().registerUnloadingHandler(() -> {
             try {
+                if (tab != null) tab.cancelPendingResults();
                 if (bridgeServer != null) bridgeServer.stop();
             } catch (Exception ignored) {
                 // best-effort cleanup
@@ -86,7 +90,14 @@ public class ClientSideEyeExtension implements BurpExtension {
             List<HttpRequestResponse> snapshot = new ArrayList<>(selected);
 
             JMenuItem item = new JMenuItem("Send to ClientSideEye (analyze response HTML/JS)");
-            item.addActionListener(e -> bg.submit(() -> analyzeSelection(snapshot)));
+            item.addActionListener(e -> {
+                long runGeneration = tab.resultGeneration();
+                item.setEnabled(false);
+                if (!tab.submitWork(() -> {
+                    try { analyzeSelection(snapshot, runGeneration); }
+                    finally { SwingUtilities.invokeLater(() -> item.setEnabled(true)); }
+                })) item.setEnabled(true);
+            });
 
             JMenu menu = new JMenu("ClientSideEye");
             menu.add(item);
@@ -94,7 +105,7 @@ public class ClientSideEyeExtension implements BurpExtension {
             return List.of(menu);
         }
 
-        private void analyzeSelection(List<HttpRequestResponse> selected) {
+        private void analyzeSelection(List<HttpRequestResponse> selected, long runGeneration) {
             try {
                 int added = 0;
                 int analyzed = 0;
@@ -104,7 +115,9 @@ public class ClientSideEyeExtension implements BurpExtension {
                 int failedItems = 0;
                 List<Finding> batch = new ArrayList<>();
 
+                if (selected.size() > 2000) throw new IllegalArgumentException("Select at most 2000 responses per run.");
                 for (HttpRequestResponse rr : selected) {
+                    if (tab.resultGeneration() != runGeneration || Thread.currentThread().isInterrupted()) break;
                     if (rr == null || rr.request() == null || rr.response() == null) {
                         skippedMissingResponse++;
                         continue;
@@ -112,30 +125,19 @@ public class ClientSideEyeExtension implements BurpExtension {
 
                     try {
                     String url = rr.request().url();
+                    if (rr.response().body().length() > AnalysisLimits.MAX_BODY_BYTES)
+                        throw new IllegalArgumentException("Response exceeds the 2 MiB analysis budget.");
                     String body = rr.response().bodyToString();
                     if (body == null || body.isBlank()) {
                         skippedEmptyBody++;
                         continue;
                     }
-                    boolean htmlLike = HtmlAnalyzer.looksLikeHtmlForAnalysis(url, body);
-                    boolean jsLike = JavaScriptAnalyzer.looksLikeJavaScriptForAnalysis(url, body);
-                    boolean sourceMapLike = SourceMapAnalyzer.looksLikeSourceMap(url, body);
-                    if (!htmlLike && !jsLike && !sourceMapLike) {
-                        skippedNonHtml++;
-                        continue;
-                    }
-
                     analyzed++;
-                    List<Finding> findings = new ArrayList<>();
-                    if (htmlLike) findings.addAll(HtmlAnalyzer.analyzeHtml(url, body));
-                    if (jsLike) {
-                        findings.addAll(JavaScriptAnalyzer.analyzeJavaScript(url, body));
-                        findings.addAll(SourceMapAnalyzer.analyzeSourceMappingReference(url, body));
-                    }
-                    if (sourceMapLike) findings.addAll(SourceMapAnalyzer.analyzeSourceMap(url, body));
+                    List<Finding> findings = ResponseAnalyzer.analyze(url, body);
                     if (!findings.isEmpty()) {
                         batch.addAll(findings);
                         added += findings.size();
+                        if (batch.size() >= 250) { tab.addFindings(batch, runGeneration); batch.clear(); }
                     }
                     } catch (Exception itemError) {
                         failedItems++;
@@ -143,7 +145,7 @@ public class ClientSideEyeExtension implements BurpExtension {
                     }
                 }
                 if (!batch.isEmpty()) {
-                    tab.addFindings(batch);
+                    tab.addFindings(batch, runGeneration);
                 }
 
                 api.logging().logToOutput(

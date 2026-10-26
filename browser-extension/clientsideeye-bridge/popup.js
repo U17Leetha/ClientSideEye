@@ -2,6 +2,7 @@ const BRIDGE_PORTS = [
   17373, 17374, 17375, 17376, 17377, 17378, 17379, 17380, 17381, 17382,
 ];
 let bridgeBase = null;
+let scanRunning = false;
 const EXEC_TIMEOUT_MS = 15000;
 const FETCH_TIMEOUT_MS = 1200;
 const TOKEN_STORAGE_KEY = "clientsideeye_bridge_token";
@@ -40,14 +41,17 @@ document.getElementById("watchSend").addEventListener("click", async () => {
 async function runScan(btn, watchMode) {
   const status = document.getElementById("status");
   const token = await getBridgeToken();
-  btn.disabled = true;
+  if (scanRunning) return;
+  scanRunning = true;
+  for (const id of ['scanSend', 'watchSend']) document.getElementById(id).disabled = true;
   status.textContent = watchMode
     ? "Watching current tab for DOM changes..."
     : "Scanning current tab...";
 
   if (!token) {
     status.textContent = "Set the bridge token before sending findings.";
-    btn.disabled = false;
+    scanRunning = false;
+    for (const id of ['scanSend', 'watchSend']) document.getElementById(id).disabled = false;
     return;
   }
 
@@ -127,7 +131,9 @@ async function runScan(btn, watchMode) {
           failed++;
           if (!nonOkStatus) nonOkStatus = `${r.status} ${r.statusText}`;
           if (r.status === 401) {
+            bridgeBase = null;
             nonOkStatus = "401 Unauthorized (check bridge token)";
+            break;
           }
         }
       } catch (e) {
@@ -143,7 +149,8 @@ async function runScan(btn, watchMode) {
   } catch (e) {
     status.textContent = `Error: ${e?.message || e}`;
   } finally {
-    btn.disabled = false;
+    scanRunning = false;
+    for (const id of ['scanSend', 'watchSend']) document.getElementById(id).disabled = false;
   }
 }
 
@@ -166,11 +173,10 @@ async function collectWatchedFindings(tabId, statusEl) {
   while (Date.now() - startedAt < WATCH_DURATION_MS) {
     const findings = await collectSnapshotFindings(tabId);
     for (const finding of findings) {
-      const key =
-        finding.identity ||
-        `${finding.url || ""}|${finding.evidence || ""}|${finding.title || ""}`;
+      const key = JSON.stringify([finding.type, finding.url, finding.identity || finding.evidence || finding.title]);
       if (seen.has(key)) continue;
       seen.add(key);
+      if (aggregated.length >= 500) throw new Error('Watch exceeded its 500-finding budget; narrow the page or scan duration.');
       aggregated.push(finding);
     }
     const secondsLeft = Math.max(
@@ -187,37 +193,46 @@ async function collectWatchedFindings(tabId, statusEl) {
 }
 
 async function resolveBridgeBase(token) {
-  if (bridgeBase) return bridgeBase;
-  let lastErr = "";
-  for (const port of BRIDGE_PORTS) {
-    const base = `http://127.0.0.1:${port}`;
+  const bases = bridgeBase ? [bridgeBase, ...BRIDGE_PORTS.map(port => `http://127.0.0.1:${port}`).filter(base => base !== bridgeBase)]
+    : BRIDGE_PORTS.map(port => `http://127.0.0.1:${port}`);
+  bridgeBase = null;
+  for (const base of bases) {
     try {
-      const r = await fetchWithTimeout(
-        `${base}/api/health`,
-        {
-          method: "GET",
-          headers: token
-            ? {
-                "X-ClientSideEye-Token": token,
-              }
-            : {},
-        },
-        FETCH_TIMEOUT_MS,
-      );
-      if (r.ok) {
-        bridgeBase = base;
-        return bridgeBase;
-      }
-      lastErr = `${base} -> ${r.status} ${r.statusText}`;
-    } catch (e) {
-      lastErr = `${base} -> ${String(e?.message || e)}`;
-    }
-  }
-  if (lastErr) {
-    const status = document.getElementById("status");
-    if (status) status.textContent = `Bridge probe failed.\nLast: ${lastErr}`;
+      // Identify the product without disclosing credentials to unrelated local listeners.
+      const response = await fetchWithTimeout(`${base}/api/health`, {method: 'GET'}, FETCH_TIMEOUT_MS);
+      if (!response.ok || !(response.headers.get('content-type') || '').includes('application/json')) continue;
+      const info = await readBridgeJson(response);
+      if (info.product !== 'ClientSideEye' || info.protocol !== 1) continue;
+      const session = await fetchWithTimeout(`${base}/api/session`, {
+        method: 'GET', headers: {'X-ClientSideEye-Token': token}
+      }, FETCH_TIMEOUT_MS);
+      if (!session.ok) continue;
+      const verified = await readBridgeJson(session);
+      if (verified.product !== 'ClientSideEye' || verified.protocol !== 1) continue;
+      bridgeBase = base;
+      return base;
+    } catch (unavailable) { /* Continue to the next bounded candidate. */ }
   }
   return null;
+}
+
+async function readBridgeJson(response) {
+  const reader = response.body.getReader();
+  const chunks = [];
+  let bytes = 0;
+  const timer = setTimeout(() => reader.cancel(), FETCH_TIMEOUT_MS);
+  try {
+    while (true) {
+      const {done, value} = await reader.read();
+      if (done) break;
+      if ((bytes += value.byteLength) > 4096) throw new Error('Bridge response exceeds budget');
+      chunks.push(value);
+    }
+    const joined = new Uint8Array(bytes);
+    let offset = 0;
+    for (const chunk of chunks) { joined.set(chunk, offset); offset += chunk.byteLength; }
+    return JSON.parse(new TextDecoder().decode(joined));
+  } finally { clearTimeout(timer); await reader.cancel(); }
 }
 
 async function getBridgeToken() {
@@ -228,13 +243,12 @@ async function getBridgeToken() {
   return (stored[TOKEN_STORAGE_KEY] || "").trim();
 }
 
-function withTimeout(promise, ms, message) {
-  return Promise.race([
-    promise,
-    new Promise((_, reject) =>
-      setTimeout(() => reject(new Error(message)), ms),
-    ),
-  ]);
+async function withTimeout(promise, ms, message) {
+  let timer;
+  try { return await Promise.race([promise, new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), ms);
+  })]); }
+  finally { clearTimeout(timer); }
 }
 
 async function fetchWithTimeout(url, options, timeoutMs) {
@@ -248,6 +262,7 @@ async function fetchWithTimeout(url, options, timeoutMs) {
 }
 
 async function collectFindings() {
+  const snapshotUrl = location.href;
   // Bounds on the network activity this scanner will do on its own (fetching external
   // <script src> bodies and any source maps they reference). Kept small and short-timeout so a
   // "passive" scan can't turn into a slow or unbounded crawl.
@@ -287,15 +302,12 @@ async function collectFindings() {
     );
   };
 
-  const isHidden = (el) => {
-    if (!el) return false;
-    const cs = window.getComputedStyle(el);
-    return (
-      !!el.hidden ||
-      cs.display === "none" ||
-      cs.visibility === "hidden" ||
-      cs.opacity === "0"
-    );
+  const isHidden = (element) => {
+    for (let el = element; el; el = el.parentElement || el.getRootNode?.().host) {
+      const cs = window.getComputedStyle(el);
+      if (el.hidden || cs.display === 'none' || cs.visibility === 'hidden' || cs.opacity === '0') return true;
+    }
+    return false;
   };
 
   const actionable = (el) => {
@@ -354,32 +366,52 @@ async function collectFindings() {
   // reference. Returns null (never throws) on any failure, timeout, CORS block, or oversized
   // response, so a single unreachable/huge resource can't break the rest of the scan.
   const fetchTextBounded = async (url) => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), INNER_FETCH_TIMEOUT_MS);
+    let reader;
     try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), INNER_FETCH_TIMEOUT_MS);
-      let resp;
-      try {
-        resp = await fetch(url, { signal: controller.signal });
-      } finally {
-        clearTimeout(timer);
+      const target = new URL(url, location.href);
+      if (!['http:', 'https:'].includes(target.protocol)) return null;
+      const response = await fetch(target.href, {signal: controller.signal});
+      if (!response.ok || Number(response.headers.get('content-length')) > MAX_FETCH_BYTES) return null;
+      reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let bytes = 0, text = '';
+      while (true) {
+        const {done, value} = await reader.read();
+        if (done) break;
+        if ((bytes += value.byteLength) > MAX_FETCH_BYTES) return null;
+        text += decoder.decode(value, {stream: true});
       }
-      if (!resp || !resp.ok) return null;
-      const lenHeader = resp.headers.get("content-length");
-      if (lenHeader && Number(lenHeader) > MAX_FETCH_BYTES) return null;
-      const text = await resp.text();
-      if (text.length > MAX_FETCH_BYTES) return null;
-      return text;
-    } catch (e) {
-      return null;
-    }
+      return text + decoder.decode();
+    } catch (unavailable) { return null; }
+    finally { clearTimeout(timer); if (reader) await reader.cancel().catch(() => {}); }
   };
 
-  const nodes = Array.from(
-    document.querySelectorAll(
-      "button,a,input,select,textarea,form,div,span,[role='button']",
-    ),
-  );
+  // Bound traversal before serializing descendants or collecting arrays of candidates.
+  const roots = [document];
+  const nodes = [];
+  for (let i = 0; i < roots.length; i++) {
+    if (roots.length > 100) throw new Error('DOM exceeds the 100-root scan budget');
+    const walker = document.createTreeWalker(roots[i], 1);
+    let element;
+    while ((element = walker.nextNode())) {
+      if (nodes.length >= 10000) throw new Error('DOM exceeds the 10000-node scan budget');
+      let depth = 0;
+      for (let parent = element.parentElement; parent; parent = parent.parentElement)
+        if (++depth > 64) throw new Error('DOM exceeds the 64-level scan budget');
+      nodes.push(element);
+      if (element.shadowRoot) roots.push(element.shadowRoot);
+      try { if (element.tagName === 'IFRAME' && element.contentDocument) roots.push(element.contentDocument); } catch (crossOrigin) {}
+    }
+  }
+  const shallowEvidence = element => {
+    const copy = element.cloneNode(false);
+    copy.textContent = (element.textContent || '').slice(0, 120);
+    return copy.outerHTML.replace(/\s+/g, ' ').slice(0, 420);
+  };
   const out = [];
+  let budgetExceeded = false;
   const seen = new Set();
 
   const pushFinding = (finding) => {
@@ -388,6 +420,7 @@ async function collectFindings() {
       `${finding.type || ""}|${finding.url || location.href}|${finding.evidence || finding.title || ""}`;
     if (seen.has(identity)) return;
     seen.add(identity);
+    if (out.length >= 120) { budgetExceeded = true; return; }
     out.push({ ...finding, identity });
   };
 
@@ -413,7 +446,7 @@ async function collectFindings() {
     const text = (el.innerText || el.textContent || el.value || "")
       .replace(/\s+/g, " ")
       .trim();
-    const outer = (el.outerHTML || "").replace(/\s+/g, " ").slice(0, 420);
+    const outer = shallowEvidence(el);
     const identity = [
       (el.tagName || "").toLowerCase(),
       el.id || "",
@@ -432,7 +465,7 @@ async function collectFindings() {
 
     const sev = conf >= 85 ? "HIGH" : conf >= 60 ? "MEDIUM" : "LOW";
     pushFinding({
-      url: location.href,
+      url: el.ownerDocument.location.href,
       type: "HIDDEN_OR_DISABLED_CONTROL",
       severity: sev,
       confidence: conf,
@@ -446,13 +479,14 @@ async function collectFindings() {
   // Password values present in the *rendered* DOM. Checking input.value (rather than the raw
   // HTML attribute, as the Java-side HtmlAnalyzer does) also catches values set at runtime by
   // JavaScript after page load, not just ones present in the initial server response.
-  for (const input of document.querySelectorAll('input[type="password"]')) {
+  for (const input of nodes.filter(el => el.matches('input[type="password"]'))) {
     const pwValue = input.value || "";
     if (!pwValue) continue;
     const isPlaceholderish = /^(password|\*+)$/i.test(pwValue.trim());
-    const outerHtml = (input.outerHTML || "").replace(/\s+/g, " ").slice(0, 420);
+    if (isPlaceholderish) continue;
+    const outerHtml = shallowEvidence(input);
     pushFinding({
-      url: location.href,
+      url: input.ownerDocument.location.href,
       type: "PASSWORD_VALUE_IN_DOM",
       severity: "HIGH",
       confidence: isPlaceholderish ? 75 : 95,
@@ -466,12 +500,12 @@ async function collectFindings() {
 
   // Role/permission hints anywhere in the rendered page (checked once, not per-element).
   try {
-    const pageHtml = document.documentElement ? document.documentElement.outerHTML : "";
+    const pageHtml = nodes.map(el => shallowEvidence(el)).join(' ');
     const roleMatch = pageHtml.match(roleHintPattern);
     if (roleMatch) {
       const matched = roleMatch[1] || roleMatch[2] || roleMatch[0];
       pushFinding({
-        url: location.href,
+        url: snapshotUrl,
         type: "ROLE_PERMISSION_HINT",
         severity: "INFO",
         confidence: 35,
@@ -495,7 +529,7 @@ async function collectFindings() {
         const trimmedValue =
           value.length > 120 ? `${value.slice(0, 120)}...` : value;
         pushFinding({
-          url: location.href,
+          url: snapshotUrl,
           type: "STORAGE_TOKEN",
           severity: value.length > 20 ? "MEDIUM" : "LOW",
           confidence: value.length > 20 ? 75 : 58,
@@ -522,7 +556,7 @@ async function collectFindings() {
         match?.[0] || "",
       );
       pushFinding({
-        url: location.href,
+        url: snapshotUrl,
         type: "DOM_XSS_SINK",
         severity: highRisk ? "MEDIUM" : "LOW",
         confidence: highRisk ? 72 : 58,
@@ -541,7 +575,7 @@ async function collectFindings() {
     ) {
       const checksOrigin = /event\.origin|targetOrigin|\.origin/i.test(body);
       pushFinding({
-        url: location.href,
+        url: snapshotUrl,
         type: "POSTMESSAGE_HANDLER",
         severity: checksOrigin ? "INFO" : "MEDIUM",
         confidence: checksOrigin ? 55 : 74,
@@ -560,7 +594,7 @@ async function collectFindings() {
     if (endpointMatches) {
       for (const match of endpointMatches.slice(0, 10)) {
         pushFinding({
-          url: location.href,
+          url: snapshotUrl,
           type: "JAVASCRIPT_ENDPOINT_REFERENCE",
           severity: /\/admin\b|\/internal\b/i.test(match) ? "MEDIUM" : "INFO",
           confidence: /\/graphql\b|\/api\//i.test(match) ? 80 : 66,
@@ -581,7 +615,7 @@ async function collectFindings() {
       const api = realtimeMatch[1];
       const endpoint = realtimeMatch[2];
       pushFinding({
-        url: location.href,
+        url: snapshotUrl,
         type: "RUNTIME_NETWORK_REFERENCE",
         severity: "INFO",
         confidence: 60,
@@ -600,7 +634,7 @@ async function collectFindings() {
     ) {
       const snippet = body.replace(/\s+/g, " ").trim().slice(0, 420);
       pushFinding({
-        url: location.href,
+        url: snapshotUrl,
         type: "INLINE_SCRIPT_SECRETISH",
         severity: "LOW",
         confidence: 30,
@@ -617,7 +651,7 @@ async function collectFindings() {
     if (devtoolsScore >= 40) {
       const snippet = body.replace(/\s+/g, " ").trim().slice(0, 420);
       pushFinding({
-        url: location.href,
+        url: snapshotUrl,
         type: "DEVTOOLS_BLOCKING",
         severity: devtoolsScore >= 65 ? "MEDIUM" : "LOW",
         confidence: devtoolsScore,
@@ -633,7 +667,7 @@ async function collectFindings() {
     const protoMatch = body.match(prototypePollutionPattern);
     if (protoMatch) {
       pushFinding({
-        url: location.href,
+        url: snapshotUrl,
         type: "PROTOTYPE_POLLUTION_HINT",
         severity: "LOW",
         confidence: 45,
@@ -651,7 +685,7 @@ async function collectFindings() {
     const sourceMapMatch = body.match(sourceMappingUrlPattern);
     if (sourceMapMatch) {
       pushFinding({
-        url: location.href,
+        url: snapshotUrl,
         type: "SOURCE_MAP_DISCLOSURE",
         severity: "INFO",
         confidence: 70,
@@ -681,7 +715,7 @@ async function collectFindings() {
                   .join(", ")
                   .slice(0, 240);
                 pushFinding({
-                  url: location.href,
+                  url: snapshotUrl,
                   type: "SOURCE_MAP_DISCLOSURE",
                   severity: "MEDIUM",
                   confidence: 82,
@@ -707,13 +741,13 @@ async function collectFindings() {
   };
 
   let externalFetchCount = 0;
-  const scriptNodes = Array.from(document.scripts || []);
+  const scriptNodes = nodes.filter(el => el.tagName === 'SCRIPT');
   for (const script of scriptNodes) {
     const src = script.src || "";
 
     if (src && endpointWords.test(src)) {
       pushFinding({
-        url: location.href,
+        url: snapshotUrl,
         type: "JAVASCRIPT_ENDPOINT_REFERENCE",
         severity: /\/admin\b|\/internal\b/i.test(src) ? "MEDIUM" : "INFO",
         confidence: /\/graphql\b|\/api\//i.test(src) ? 78 : 60,
@@ -760,7 +794,7 @@ async function collectFindings() {
       if (!isApiLike) continue;
 
       pushFinding({
-        url: location.href,
+        url: snapshotUrl,
         type: "RUNTIME_NETWORK_REFERENCE",
         severity:
           /\/admin\b|\/internal\b/.test(lower) || isGraphql ? "MEDIUM" : "INFO",
@@ -773,5 +807,7 @@ async function collectFindings() {
     }
   } catch (e) {}
 
-  return out.slice(0, 120);
+  if (budgetExceeded) throw new Error('Snapshot exceeds the 120-finding budget; narrow the page.');
+  if (location.href !== snapshotUrl) throw new Error('Page route changed during the snapshot; scan the current route again.');
+  return out;
 }

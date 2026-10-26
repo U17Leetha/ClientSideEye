@@ -7,7 +7,7 @@ import org.jsoup.nodes.Node;
 import org.jsoup.nodes.TextNode;
 import org.jsoup.select.Elements;
 
-import java.net.URI;
+import java.net.URL;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
@@ -59,9 +59,17 @@ public final class HtmlAnalyzer {
         return s.substring(0, max) + "...";
     }
 
+    private static String evidenceFor(Element element) {
+        Element shallow = new Element(element.tagName());
+        for (org.jsoup.nodes.Attribute attribute : element.attributes())
+            shallow.attr(attribute.getKey(), shrink(attribute.getValue(), 200));
+        shallow.text(shrink(element.ownText(), 120));
+        return shallow.outerHtml();
+    }
+
     private static String hostFromUrl(String url) {
         try {
-            return URI.create(url).getHost() == null ? "" : URI.create(url).getHost();
+            return new URL(url).getHost();
         } catch (Exception e) {
             return "";
         }
@@ -71,8 +79,19 @@ public final class HtmlAnalyzer {
         if (html == null || html.isBlank()) return List.of();
         if (!looksLikeHtmlForAnalysis(url, html)) return List.of();
 
+        AnalysisLimits.checkBody(html);
         Document document = Jsoup.parse(html, url);
         List<Finding> out = new ArrayList<>();
+        int nodes = 0;
+        for (java.util.Iterator<org.jsoup.nodes.Node> nodesIterator = document.nodeStream().iterator(); nodesIterator.hasNext();) {
+            org.jsoup.nodes.Node node = nodesIterator.next();
+            if (++nodes > AnalysisLimits.MAX_NODES)
+                throw new IllegalArgumentException("HTML exceeds the 10000-node analysis budget.");
+            int depth = 0;
+            for (org.jsoup.nodes.Node ancestor = node.parent(); ancestor != null; ancestor = ancestor.parent())
+                if (++depth > AnalysisLimits.MAX_DEPTH)
+                    throw new IllegalArgumentException("HTML exceeds the 64-level analysis budget.");
+        }
         String host = hostFromUrl(url);
 
         addPasswordFindings(out, document, url, host);
@@ -87,11 +106,11 @@ public final class HtmlAnalyzer {
             if (!input.hasAttr("value")) continue;
 
             String value = input.attr("value").trim();
+            if (value.isEmpty() || value.equalsIgnoreCase("password") || value.matches("\\*+")) continue;
             int conf = 95;
-            if (value.isEmpty()) conf = 70;
-            if (value.equalsIgnoreCase("password") || value.equalsIgnoreCase("********")) conf = 75;
 
-            String evidence = shrink(input.outerHtml(), 400);
+            String evidence = shrink(evidenceFor(input), 400);
+            AnalysisLimits.checkFindings(out.size() + 1);
             out.add(new Finding(
                     FindingType.PASSWORD_VALUE_IN_DOM.name(),
                     Severity.HIGH,
@@ -135,11 +154,12 @@ public final class HtmlAnalyzer {
 
             String state = (hidden ? "hidden" : "") + (hidden && disabled ? " & " : "") + (disabled ? "disabled" : "");
             String why = signals.reasons.isEmpty() ? "" : ("Signals: " + String.join(", ", signals.reasons) + ".");
-            String evidence = shrink(element.outerHtml(), 420);
+            String evidence = shrink(evidenceFor(element), 420);
             String identity = elementIdentity(element);
 
             if (signals.actionable) {
-                out.add(new Finding(
+                AnalysisLimits.checkFindings(out.size() + 1);
+            out.add(new Finding(
                         FindingType.HIDDEN_OR_DISABLED_CONTROL.name(),
                         severityForActionableHiddenControl(signals.confidence),
                         signals.confidence,
@@ -153,7 +173,8 @@ public final class HtmlAnalyzer {
                 ));
             } else {
                 int infoConf = Math.min(45, Math.max(15, signals.confidence));
-                out.add(new Finding(
+                AnalysisLimits.checkFindings(out.size() + 1);
+            out.add(new Finding(
                         FindingType.HIDDEN_OR_DISABLED_CONTROL.name(),
                         Severity.INFO,
                         infoConf,
@@ -178,7 +199,8 @@ public final class HtmlAnalyzer {
         if (!matcher.find()) return;
 
         String matched = matcher.group(1) != null ? matcher.group(1) : matcher.group(2);
-        out.add(new Finding(
+        AnalysisLimits.checkFindings(out.size() + 1);
+            out.add(new Finding(
                 FindingType.ROLE_PERMISSION_HINT.name(),
                 Severity.INFO,
                 35,
@@ -217,6 +239,7 @@ public final class HtmlAnalyzer {
         addDevtoolsFindings(out, devtoolsCandidates, url, host);
 
         if (devtoolsCandidates.isEmpty() && looksDevtoolsHint(html)) {
+            AnalysisLimits.checkFindings(out.size() + 1);
             out.add(new Finding(
                     FindingType.DEVTOOLS_BLOCKING.name(),
                     Severity.INFO,
@@ -239,13 +262,9 @@ public final class HtmlAnalyzer {
         boolean a11yOnlyHidden = classes.contains("sr-only")
                 || classes.contains("visually-hidden")
                 || classes.contains("visuallyhidden");
-        boolean visuallyHidden = style.contains("display:none")
-                || style.contains("display: none")
-                || style.contains("visibility:hidden")
-                || style.contains("visibility: hidden")
-                || style.contains("opacity:0")
-                || style.contains("opacity: 0");
-        boolean hiddenAttribute = element.hasAttr("hidden") || element.hasAttr("aria-hidden");
+        boolean visuallyHidden = java.util.regex.Pattern.compile("(?:^|;)\\s*(?:display\\s*:\\s*none|visibility\\s*:\\s*hidden|opacity\\s*:\\s*0(?:\\.0+)?)(?:\\s*!important)?\\s*(?:;|$)")
+                .matcher(style).find();
+        boolean hiddenAttribute = element.hasAttr("hidden") || "true".equalsIgnoreCase(element.attr("aria-hidden"));
         boolean hiddenClass = classes.contains("hidden") || classes.contains("d-none");
 
         if (a11yOnlyHidden && !visuallyHidden && !hiddenAttribute) return false;
@@ -294,7 +313,7 @@ public final class HtmlAnalyzer {
         int action = 0;
 
         String tag = element.tagName().toLowerCase(Locale.ROOT);
-        String lowerHtml = element.outerHtml().toLowerCase(Locale.ROOT);
+        String lowerHtml = element.tagName() + " " + element.attributes().html();
         String href = element.attr("href").toLowerCase(Locale.ROOT);
 
         if (element.hasAttr("onclick") || element.hasAttr("onmousedown") || element.hasAttr("onmouseup") || element.hasAttr("onchange")) {
@@ -448,6 +467,7 @@ public final class HtmlAnalyzer {
         for (ScriptCandidate candidate : candidates) {
             String snippet = shrink(candidate.body, 420);
             if (!seen.add(snippet)) continue;
+            AnalysisLimits.checkFindings(out.size() + 1);
             out.add(new Finding(
                     FindingType.INLINE_SCRIPT_SECRETISH.name(),
                     Severity.LOW,
@@ -471,6 +491,7 @@ public final class HtmlAnalyzer {
             String snippet = shrink(candidate.body, 420);
             if (!seen.add(snippet)) continue;
             Severity severity = candidate.confidence >= 65 ? Severity.MEDIUM : Severity.LOW;
+            AnalysisLimits.checkFindings(out.size() + 1);
             out.add(new Finding(
                     FindingType.DEVTOOLS_BLOCKING.name(),
                     severity,

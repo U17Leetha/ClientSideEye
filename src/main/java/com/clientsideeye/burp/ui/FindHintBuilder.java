@@ -44,16 +44,20 @@ final class FindHintBuilder {
     }
 
     static Result build(String evidence) {
-        String id = extractAttr(evidence, "id");
-        String dataTestId = extractAttr(evidence, "data-testid");
-        String name = extractAttr(evidence, "name");
-        String ariaLabel = extractAttr(evidence, "aria-label");
-        String role = extractAttr(evidence, "role");
-        String type = extractAttr(evidence, "type");
-        String value = extractAttr(evidence, "value");
-        String href = extractAttr(evidence, "href");
-        String src = extractAttr(evidence, "src");
-        String action = extractAttr(evidence, "action");
+        if (evidence != null && evidence.length() > 65536) throw new IllegalArgumentException("Evidence exceeds the hint budget.");
+        org.jsoup.nodes.Document document = org.jsoup.Jsoup.parseBodyFragment(evidence == null ? "" : evidence);
+        org.jsoup.nodes.Element element = document.body().children().first();
+        if (element == null) element = new org.jsoup.nodes.Element("span");
+        String id = element.attr("id");
+        String dataTestId = element.attr("data-testid");
+        String name = element.attr("name");
+        String ariaLabel = element.attr("aria-label");
+        String role = element.attr("role");
+        String type = element.attr("type");
+        String value = element.attr("value");
+        String href = element.attr("href");
+        String src = element.attr("src");
+        String action = element.attr("action");
         String text = extractInnerText(evidence);
 
         List<SelectorCandidate> selectors = rankedSelectors(id, dataTestId, name, ariaLabel, role, type, value, href, src, action, text);
@@ -134,18 +138,6 @@ final class FindHintBuilder {
             if (!value.isBlank()) {
                 addCandidate(out, seen, "Locate (fallback: type + value)", "input[type=\"" + cssEscape(type) + "\"][value=\"" + cssEscape(value) + "\"]");
             }
-            addCandidate(out, seen, "Locate (fallback: type)", "button[type=\"" + cssEscape(type) + "\"],input[type=\"" + cssEscape(type) + "\"],select[type=\"" + cssEscape(type) + "\"]");
-        }
-        if (!role.isBlank() && !text.isBlank()) {
-            addCandidate(out, seen, "Locate (fallback: role + text)", "[role=\"" + cssEscape(role) + "\"]");
-        }
-        if (!text.isBlank()) {
-            String normalized = text.length() > 40 ? text.substring(0, 40) : text;
-            addCandidate(out, seen, "Locate (fallback: button-ish text)", "button,a,[role=\"button\"],input[type=\"button\"],input[type=\"submit\"]");
-            addCandidate(out, seen, "Locate (fallback: text anchor)", "*");
-            if (!normalized.isBlank()) {
-                // keep text available for later snippets
-            }
         }
         return out;
     }
@@ -160,15 +152,10 @@ final class FindHintBuilder {
 
     static String extractAttr(String text, String attr) {
         if (text == null) return "";
-        Pattern p = Pattern.compile("(?i)\\b" + Pattern.quote(attr) + "\\s*=\\s*(?:([\"'])(.*?)\\1|([^\\s>]+))");
-        Matcher m = p.matcher(text);
-        if (m.find()) {
-            String quoted = m.group(2);
-            if (quoted != null) return quoted;
-            String unquoted = m.group(3);
-            return unquoted == null ? "" : unquoted;
-        }
-        return "";
+        if (text.length() > 65536) throw new IllegalArgumentException("Evidence exceeds the hint budget.");
+        var document = org.jsoup.Jsoup.parseBodyFragment(text);
+        var element = document.selectFirst("[" + attr + "]");
+        return element == null ? "" : element.attr(attr);
     }
 
     static String bestEvidenceSearchTerm(String evidence) {
@@ -242,8 +229,16 @@ final class FindHintBuilder {
                 + "  const wantText = '" + jsText + "'.trim().toLowerCase();\n"
                 + "  const seen = new Set();\n"
                 + "  const roots = [document];\n"
-                + "  [...document.querySelectorAll('*')].forEach(el => { if (el.shadowRoot) roots.push(el.shadowRoot); });\n"
-                + "  [...document.querySelectorAll('iframe')].forEach(frame => { try { if (frame.contentDocument) roots.push(frame.contentDocument); } catch (e) {} });\n"
+                + "  let visitedNodes = 0;\n"
+                + "  for (let i = 0; i < roots.length; i++) {\n"
+                + "    if (roots.length > 100) throw new Error('DOM root budget exceeded');\n"
+                + "    const walker = document.createTreeWalker(roots[i], 1);\n"
+                + "    let el; while ((el = walker.nextNode())) {\n"
+                + "      if (++visitedNodes > 10000) throw new Error('DOM node budget exceeded');\n"
+                + "      if (el.shadowRoot) roots.push(el.shadowRoot);\n"
+                + "      try { if (el.tagName === 'IFRAME' && el.contentDocument) roots.push(el.contentDocument); } catch (crossOrigin) {}\n"
+                + "    }\n"
+                + "  }\n"
                 + "  const matches = [];\n"
                 + "  const add = el => { if (el && !seen.has(el)) { seen.add(el); matches.push(el); } };\n"
                 + "  roots.forEach(root => {\n"
@@ -279,8 +274,16 @@ final class FindHintBuilder {
                 + "  const seen = new Set();\n"
                 + "  const add = el => { if (el && !seen.has(el)) { seen.add(el); matches.push(el); } };\n"
                 + "  const roots = [document];\n"
-                + "  [...document.querySelectorAll('*')].forEach(el => { if (el.shadowRoot) roots.push(el.shadowRoot); });\n"
-                + "  [...document.querySelectorAll('iframe')].forEach(frame => { try { if (frame.contentDocument) roots.push(frame.contentDocument); } catch (e) {} });\n"
+                + "  let visitedNodes = 0;\n"
+                + "  for (let i = 0; i < roots.length; i++) {\n"
+                + "    if (roots.length > 100) throw new Error('DOM root budget exceeded');\n"
+                + "    const walker = document.createTreeWalker(roots[i], 1);\n"
+                + "    let el; while ((el = walker.nextNode())) {\n"
+                + "      if (++visitedNodes > 10000) throw new Error('DOM node budget exceeded');\n"
+                + "      if (el.shadowRoot) roots.push(el.shadowRoot);\n"
+                + "      try { if (el.tagName === 'IFRAME' && el.contentDocument) roots.push(el.contentDocument); } catch (crossOrigin) {}\n"
+                + "    }\n"
+                + "  }\n"
                 + "  roots.forEach(root => {\n"
                 + "    try {\n"
                 + "      " + baseLocate + "\n"
@@ -344,7 +347,6 @@ final class FindHintBuilder {
 
     private static String revealSnippet(String selector, String dataTestId, String text, String role, String type) {
         String jsSelector = jsSingleQuoteEscape(selector == null ? "" : selector);
-        String jsTestId = jsSingleQuoteEscape(dataTestId == null ? "" : dataTestId);
         String jsText = jsSingleQuoteEscape(text == null ? "" : text);
         String jsRole = jsSingleQuoteEscape(role == null ? "" : role);
         String jsType = jsSingleQuoteEscape(type == null ? "" : type);
@@ -354,12 +356,19 @@ final class FindHintBuilder {
                 + "  const seen = new Set();\n"
                 + "  const add = el => { if (el && !seen.has(el)) { seen.add(el); matches.push(el); } };\n"
                 + "  const roots = [document];\n"
-                + "  [...document.querySelectorAll('*')].forEach(el => { if (el.shadowRoot) roots.push(el.shadowRoot); });\n"
-                + "  [...document.querySelectorAll('iframe')].forEach(frame => { try { if (frame.contentDocument) roots.push(frame.contentDocument); } catch (e) {} });\n"
+                + "  let visitedNodes = 0;\n"
+                + "  for (let i = 0; i < roots.length; i++) {\n"
+                + "    if (roots.length > 100) throw new Error('DOM root budget exceeded');\n"
+                + "    const walker = document.createTreeWalker(roots[i], 1);\n"
+                + "    let el; while ((el = walker.nextNode())) {\n"
+                + "      if (++visitedNodes > 10000) throw new Error('DOM node budget exceeded');\n"
+                + "      if (el.shadowRoot) roots.push(el.shadowRoot);\n"
+                + "      try { if (el.tagName === 'IFRAME' && el.contentDocument) roots.push(el.contentDocument); } catch (crossOrigin) {}\n"
+                + "    }\n"
+                + "  }\n"
                 + "  roots.forEach(root => {\n"
                 + "    try {\n"
                 + "      if ('" + jsSelector + "') root.querySelectorAll('" + jsSelector + "').forEach(add);\n"
-                + "      if (!matches.length && '" + jsTestId + "') root.querySelectorAll('[data-testid=\"" + jsDoubleQuoteEscape(dataTestId == null ? "" : dataTestId) + "\"]').forEach(add);\n"
                 + "      if (!matches.length && '" + jsText + "') {\n"
                 + "        root.querySelectorAll('button,a,input,select,textarea,[role],[role=\"button\"]').forEach(el => {\n"
                 + "          const textValue = (el.innerText || el.textContent || el.value || '').replace(/\\s+/g, ' ').trim().toLowerCase();\n"
@@ -371,6 +380,7 @@ final class FindHintBuilder {
                 + "      }\n"
                 + "    } catch (e) {}\n"
                 + "  });\n"
+                + "  if (matches.length !== 1) return console.warn('[ClientSideEye] expected one target, found', matches.length);\n"
                 + "  const revealOne = (el) => {\n"
                 + "    let node = el;\n"
                 + "    while (node && node.nodeType === 1) {\n"
@@ -424,18 +434,28 @@ final class FindHintBuilder {
         return s;
     }
 
-    static String jsSingleQuoteEscape(String s) {
-        if (s == null) return "";
-        return s.replace("\\", "\\\\").replace("'", "\\'");
-    }
-
-    static String jsDoubleQuoteEscape(String s) {
-        if (s == null) return "";
-        return s.replace("\\", "\\\\").replace("\"", "\\\"");
+    static String jsSingleQuoteEscape(String value) {
+        if (value == null) return "";
+        StringBuilder out = new StringBuilder();
+        for (int i = 0; i < value.length(); i++) {
+            char ch = value.charAt(i);
+            switch (ch) {
+                case '\\' -> out.append("\\\\");
+                case '\'' -> out.append("\\'");
+                case '\n' -> out.append("\\n");
+                case '\r' -> out.append("\\r");
+                default -> {
+                    if (ch < 32 || ch == '\u2028' || ch == '\u2029') out.append(String.format("\\u%04x", (int) ch));
+                    else out.append(ch);
+                }
+            }
+        }
+        return out.toString();
     }
 
     static String cssEscape(String s) {
         if (s == null) return "";
-        return s.replace("\\", "\\\\").replace("\"", "\\\"");
+        return s.replace("\\", "\\\\").replace("\"", "\\\"")
+            .replace("\n", "\\a ").replace("\r", "\\d ").replace("\f", "\\c ");
     }
 }

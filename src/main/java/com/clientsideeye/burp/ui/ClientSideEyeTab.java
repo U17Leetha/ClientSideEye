@@ -6,6 +6,8 @@ import burp.api.montoya.http.message.HttpRequestResponse;
 import burp.api.montoya.ui.editor.RawEditor;
 
 import com.clientsideeye.burp.core.Finding;
+import com.clientsideeye.burp.core.AnalysisLimits;
+import com.clientsideeye.burp.core.ResponseAnalyzer;
 import com.clientsideeye.burp.core.FindingType;
 import com.clientsideeye.burp.core.HtmlAnalyzer;
 import com.clientsideeye.burp.core.JavaScriptAnalyzer;
@@ -34,6 +36,17 @@ public class ClientSideEyeTab extends JPanel {
     private final MontoyaApi api;
     private final ExecutorService bg;
 
+    private final java.util.concurrent.atomic.AtomicLong generation = new java.util.concurrent.atomic.AtomicLong();
+    private boolean scanRunning;
+    public boolean submitWork(Runnable task) {
+        try { bg.execute(task); return true; }
+        catch (java.util.concurrent.RejectedExecutionException busy) {
+            JOptionPane.showMessageDialog(this, "Background work is busy or the extension has stopped. Wait for the current operation.", "ClientSideEye", JOptionPane.WARNING_MESSAGE);
+            return false;
+        }
+    }
+    public long resultGeneration() { return generation.get(); }
+    public void cancelPendingResults() { generation.incrementAndGet(); }
     private static final int MAX_FINDINGS = 5000;
     private static final int SITE_MAP_SCAN_WARN_THRESHOLD = 1000;
     private static final int SITE_MAP_SCAN_HARD_CAP = 2000;
@@ -54,7 +67,7 @@ public class ClientSideEyeTab extends JPanel {
     private final JTextField filterHost = new JTextField();
     private final JTextField filterSearch = new JTextField();
     private final JTextField bridgeEndpointField = new JTextField("Bridge not started");
-    private final JTextField bridgeTokenField = new JTextField();
+    private final JPasswordField bridgeTokenField = new JPasswordField();
     private final JSpinner scanLimitSpinner = new JSpinner(new SpinnerNumberModel(SITE_MAP_SCAN_HARD_CAP, 100, 10000, 100));
     private final JCheckBox exportVisibleOnly = new JCheckBox("Export visible rows only", true);
 
@@ -212,6 +225,7 @@ public class ClientSideEyeTab extends JPanel {
 
         // listeners
         btnPurge.addActionListener(e -> {
+            cancelPendingResults();
             findingsByKey.clear();
             falsePositiveKeys.clear();
             refreshTable();
@@ -223,10 +237,17 @@ public class ClientSideEyeTab extends JPanel {
         btnAnalyzeSiteMap.addActionListener(e -> {
             int limit = ((Number) scanLimitSpinner.getValue()).intValue();
             String hostFilter = filterHost.getText().trim().toLowerCase(Locale.ROOT);
-            bg.submit(() -> analyzeSiteMapInScope(limit, hostFilter));
+            if (scanRunning) return;
+            scanRunning = true;
+            btnAnalyzeSiteMap.setEnabled(false);
+            long runGeneration = resultGeneration();
+            if (!submitWork(() -> {
+                try { analyzeSiteMapInScope(limit, hostFilter, runGeneration); }
+                finally { SwingUtilities.invokeLater(() -> { scanRunning = false; btnAnalyzeSiteMap.setEnabled(true); }); }
+            })) { scanRunning = false; btnAnalyzeSiteMap.setEnabled(true); }
         });
         btnCopyToken.addActionListener(e -> {
-            copyToClipboard(bridgeTokenField.getText());
+            copyToClipboard(new String(bridgeTokenField.getPassword()));
             api.logging().logToOutput("[ClientSideEye] Copied browser bridge token to clipboard.");
         });
         filterHigh.addActionListener(e -> refreshTable());
@@ -320,25 +341,36 @@ public class ClientSideEyeTab extends JPanel {
     private static final String PREF_EXPORT_VISIBLE_ONLY = "exportVisibleOnly";
 
     // Called by extension (context menu / site map analysis)
-    public void addFindings(List<Finding> findings) {
-        if (findings == null || findings.isEmpty()) return;
+    public void addFindings(List<Finding> findings) { addFindings(findings, resultGeneration()); }
 
-        SwingUtilities.invokeLater(() -> {
-            for (Finding f : findings) {
-                findingsByKey.put(f.stableKey(), f);
+    public void addFindings(List<Finding> findings, long runGeneration) {
+        if (findings == null || findings.isEmpty()) return;
+        List<Finding> snapshot = List.copyOf(findings);
+        Runnable update = () -> {
+            if (runGeneration != resultGeneration()) return;
+            for (Finding f : snapshot) {
+                Finding previous = findingsByKey.get(f.stableKey());
+                findingsByKey.put(f.stableKey(), previous == null ? f : f.withFirstSeen(previous.firstSeen()));
             }
 
             // cap
             while (findingsByKey.size() > MAX_FINDINGS) {
                 String firstKey = findingsByKey.keySet().iterator().next();
                 findingsByKey.remove(firstKey);
+                falsePositiveKeys.remove(firstKey);
             }
 
             refreshTable();
-        });
+        };
+        if (SwingUtilities.isEventDispatchThread()) update.run();
+        else {
+            try { SwingUtilities.invokeAndWait(update); }
+            catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); }
+            catch (java.lang.reflect.InvocationTargetException failed) { throw new IllegalStateException("Could not update findings", failed.getCause()); }
+        }
     }
 
-    private void analyzeSiteMapInScope(int scanLimit, String hostFilter) {
+    private void analyzeSiteMapInScope(int scanLimit, String hostFilter, long runGeneration) {
         try {
             List<HttpRequestResponse> items = api.siteMap().requestResponses();
             long inScopeCount = items.stream()
@@ -368,6 +400,7 @@ public class ClientSideEyeTab extends JPanel {
             List<Finding> batch = new ArrayList<>();
 
             for (HttpRequestResponse rr : items) {
+                if (runGeneration != resultGeneration() || Thread.currentThread().isInterrupted()) break;
                 if (rr == null || rr.request() == null || rr.response() == null) continue;
                 if (!rr.request().isInScope()) continue;
                     if (!scanHostMatches(rr.request().url(), hostFilter)) continue;
@@ -377,24 +410,14 @@ public class ClientSideEyeTab extends JPanel {
                 }
 
                 try {
+                if (rr.response().body().length() > AnalysisLimits.MAX_BODY_BYTES)
+                    throw new IllegalArgumentException("Response exceeds the 2 MiB analysis budget.");
                 String body = rr.response().bodyToString();
                 if (body == null || body.isBlank()) continue;
 
                 String url = rr.request().url();
-                boolean htmlLike = HtmlAnalyzer.looksLikeHtmlForAnalysis(url, body);
-                boolean jsLike = JavaScriptAnalyzer.looksLikeJavaScriptForAnalysis(url, body);
-                boolean sourceMapLike = SourceMapAnalyzer.looksLikeSourceMap(url, body);
-                if (!htmlLike && !jsLike && !sourceMapLike) {
-                    skippedNonAnalyzable++;
-                    continue;
-                }
-                List<Finding> f = new ArrayList<>();
-                if (htmlLike) f.addAll(HtmlAnalyzer.analyzeHtml(url, body));
-                if (jsLike) {
-                    f.addAll(JavaScriptAnalyzer.analyzeJavaScript(url, body));
-                    f.addAll(SourceMapAnalyzer.analyzeSourceMappingReference(url, body));
-                }
-                if (sourceMapLike) f.addAll(SourceMapAnalyzer.analyzeSourceMap(url, body));
+                List<Finding> f = ResponseAnalyzer.analyze(url, body);
+                if (f.isEmpty()) skippedNonAnalyzable++;
                 analyzed++;
                 if (!f.isEmpty()) {
                     added += f.size();
@@ -403,7 +426,7 @@ public class ClientSideEyeTab extends JPanel {
                     // in the table, without queuing one EDT refresh per matched page (which
                     // previously caused an O(n^2) table-rebuild storm on large Site Maps).
                     if (batch.size() >= FINDINGS_FLUSH_BATCH_SIZE) {
-                        addFindings(new ArrayList<>(batch));
+                        addFindings(new ArrayList<>(batch), runGeneration);
                         batch.clear();
                     }
                 }
@@ -413,7 +436,7 @@ public class ClientSideEyeTab extends JPanel {
                 }
             }
             if (!batch.isEmpty()) {
-                addFindings(batch);
+                addFindings(batch, runGeneration);
             }
 
             String hostScope = hostFilter.isEmpty() ? "(all in-scope hosts)" : hostFilter;
@@ -509,13 +532,14 @@ public class ClientSideEyeTab extends JPanel {
                 : new ArrayList<>(findingsByKey.values());
         Set<String> fpSnapshot = new HashSet<>(falsePositiveKeys);
 
-        bg.submit(() -> {
+        submitWork(() -> {
             try {
                 String json = JsonExporter.toJson(toExport, fpSnapshot);
                 Files.writeString(out.toPath(), json);
                 api.logging().logToOutput("[ClientSideEye] Exported: " + out.getAbsolutePath());
             } catch (Exception ex) {
                 api.logging().logToError("[ClientSideEye] Export failed: " + ex);
+                SwingUtilities.invokeLater(() -> JOptionPane.showMessageDialog(this, "Could not export report: " + ex.getMessage(), "ClientSideEye", JOptionPane.ERROR_MESSAGE));
             }
         });
     }
@@ -565,7 +589,7 @@ public class ClientSideEyeTab extends JPanel {
             FindHintBuilder.HintEntry selected = (FindHintBuilder.HintEntry) hintCombo.getSelectedItem();
             String hint = selected == null ? "" : selected.value();
             copyToClipboard(hint);
-            api.logging().logToOutput("[ClientSideEye] Copied find hint to clipboard: " + hint);
+            api.logging().logToOutput("[ClientSideEye] Copied find hint to clipboard.");
         });
 
         String revealSnippet = hintResult.revealSnippet;
@@ -866,7 +890,7 @@ public class ClientSideEyeTab extends JPanel {
         if (hostFilter.isEmpty()) return true;
         String hostScope = hostFilter;
         try {
-            String host = new java.net.URI(url).getHost();
+            String host = new java.net.URL(url).getHost();
             return host != null && host.toLowerCase(Locale.ROOT).contains(hostScope);
         } catch (Exception e) {
             return false;

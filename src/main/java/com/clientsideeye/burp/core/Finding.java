@@ -95,12 +95,14 @@ public final class Finding {
 
     // Stable dedupe key (type+url+evidence signature)
     public String stableKey() {
-        String basis = identity;
-        if (basis.isBlank()) {
-            basis = title + "|" + evidence;
-        }
-        if (basis.length() > 400) basis = basis.substring(0, 400);
-        return type + "|" + url + "|" + Integer.toHexString(basis.hashCode());
+        // Length prefixes avoid ambiguity without discarding or hashing attacker-controlled identity.
+        String basis = identity.isBlank() ? title.length() + ":" + title + evidence : identity;
+        return type.length() + ":" + type + url.length() + ":" + url + basis;
+    }
+
+    public Finding withFirstSeen(String originalFirstSeen) {
+        return new Finding(type, severity, confidence, url, host, title, summary, evidence,
+            recommendation, identity, originalFirstSeen);
     }
 
     private static int clamp(int v, int lo, int hi) {

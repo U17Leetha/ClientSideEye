@@ -88,6 +88,53 @@ class BrowserBridgeServerNetworkTest {
         }
     }
 
+    @Test
+    void rejectsUnauthenticatedBodyBeforeReadingIt() throws Exception {
+        server = startServer();
+        assertEquals("HTTP/1.1 401 Unauthorized", exchange("POST /api/finding HTTP/1.1\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 100\r\n\r\n").trim());
+    }
+
+    @Test
+    void rejectsAmbiguousFramingAndMalformedForms() throws Exception {
+        server = startServer();
+        assertTrue(exchange("POST /api/finding HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\n").contains("400"));
+        assertTrue(exchange("POST /api/finding HTTP/1.1\r\nContent-Length: -1\r\n\r\n").contains("400"));
+        assertTrue(exchange("POST /api/finding HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n").contains("400"));
+    }
+
+    @Test
+    void authenticatesSessionAndReadsUtf8ByByteLength() throws Exception {
+        server = startServer();
+        String token = "X-ClientSideEye-Token: " + server.authToken() + "\r\n";
+        assertTrue(exchange("GET /api/session HTTP/1.1\r\n" + token + "\r\n").contains("200"));
+        String body = "url=https://example.test/open?q=\"><tag>&evidence=Unicode-λ";
+        String request = "POST /api/finding HTTP/1.1\r\n" + token + "Content-Type: application/x-www-form-urlencoded\r\nContent-Length: " + body.getBytes(StandardCharsets.UTF_8).length + "\r\n\r\n" + body;
+        assertTrue(exchange(request).contains("200"));
+        assertTrue(exchange("POST /api/finding HTTP/1.1\r\n" + token + "Content-Type: application/x-www-form-urlencoded\r\nContent-Length: 8\r\n\r\nurl=%ZZZ").contains("400"));
+    }
+
+    @Test
+    void stopClosesIncompleteAcceptedClients() throws Exception {
+        server = startServer();
+        try (Socket socket = new Socket("127.0.0.1", server.boundPort())) {
+            socket.setSoTimeout(1500);
+            socket.getOutputStream().write('G');
+            Thread.sleep(50);
+            server.stop();
+            try { assertEquals(-1, socket.getInputStream().read()); }
+            catch (java.net.SocketException reset) { /* A reset is also an explicit close. */ }
+        }
+    }
+
+    private String exchange(String request) throws Exception {
+        try (Socket socket = new Socket("127.0.0.1", server.boundPort())) {
+            socket.setSoTimeout(1500);
+            socket.getOutputStream().write(request.getBytes(StandardCharsets.UTF_8));
+            socket.getOutputStream().flush();
+            return readStatusLine(socket);
+        }
+    }
+
     private static BrowserBridgeServer startServer() {
         MontoyaApi api = mock(MontoyaApi.class);
         when(api.logging()).thenReturn(mock(Logging.class));

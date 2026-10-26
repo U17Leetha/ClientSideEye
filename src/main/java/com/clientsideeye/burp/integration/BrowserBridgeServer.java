@@ -14,8 +14,17 @@ import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
 import java.net.InetSocketAddress;
-import java.net.URI;
+import java.net.URL;
 import java.net.URLDecoder;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.io.ByteArrayOutputStream;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.RejectedExecutionException;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Base64;
@@ -42,7 +51,11 @@ public final class BrowserBridgeServer {
     private final String authToken;
     private volatile boolean running;
     private ServerSocket serverSocket;
-    private int boundPort = -1;
+    private volatile int boundPort = -1;
+    private final Set<Socket> clients = ConcurrentHashMap.newKeySet();
+    private static final int MAX_LINE_BYTES = 8 * 1024;
+    private static final int MAX_HEADER_BYTES = 16 * 1024;
+    private static final int MAX_HEADER_COUNT = 100;
 
     public BrowserBridgeServer(MontoyaApi api, ClientSideEyeTab tab) {
         this.api = api;
@@ -52,16 +65,18 @@ public final class BrowserBridgeServer {
             t.setDaemon(true);
             return t;
         });
-        this.clientExec = Executors.newCachedThreadPool(r -> {
-            Thread t = new Thread(r, "ClientSideEye-bridge-client");
-            t.setDaemon(true);
-            return t;
-        });
+        this.clientExec = new ThreadPoolExecutor(4, 4, 0, TimeUnit.SECONDS,
+            new ArrayBlockingQueue<>(8), r -> {
+                Thread t = new Thread(r, "ClientSideEye-bridge-client");
+                t.setDaemon(true);
+                return t;
+            });
         this.authToken = generateToken();
     }
 
     public synchronized void start() {
         if (running) return;
+        if (acceptExec.isShutdown()) throw new IllegalStateException("Bridge has been stopped.");
         IOException last = null;
         for (int i = 0; i < MAX_PORT_ATTEMPTS; i++) {
             int candidatePort = PORT + i;
@@ -74,7 +89,6 @@ public final class BrowserBridgeServer {
                 running = true;
                 acceptExec.submit(this::acceptLoop);
                 api.logging().logToOutput("[ClientSideEye] Browser bridge listening on http://" + HOST + ":" + boundPort + " (/api/health, /api/finding)");
-                api.logging().logToOutput("[ClientSideEye] Browser bridge token: " + authToken);
                 if (boundPort != PORT) {
                     api.logging().logToOutput("[ClientSideEye] Default port " + PORT + " was busy. Using fallback port " + boundPort + ".");
                 }
@@ -101,6 +115,11 @@ public final class BrowserBridgeServer {
         } finally {
             serverSocket = null;
         }
+        for (Socket client : clients) {
+            try { client.close(); } catch (IOException ignored) { }
+        }
+        clients.clear();
+        boundPort = -1;
         acceptExec.shutdownNow();
         clientExec.shutdownNow();
     }
@@ -108,9 +127,15 @@ public final class BrowserBridgeServer {
     private void acceptLoop() {
         while (running) {
             try {
-                Socket s = serverSocket.accept();
-                s.setSoTimeout(SOCKET_READ_TIMEOUT_MS);
-                clientExec.submit(() -> handleClient(s));
+                Socket client = serverSocket.accept();
+                long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(SOCKET_READ_TIMEOUT_MS);
+                clients.add(client);
+                if (!running) { clients.remove(client); client.close(); break; }
+                try { clientExec.execute(() -> handleClient(client, deadline)); }
+                catch (RejectedExecutionException full) {
+                    clients.remove(client);
+                    client.close();
+                }
             } catch (SocketTimeoutException ignored) {
                 // periodic loop check
             } catch (Exception e) {
@@ -121,129 +146,107 @@ public final class BrowserBridgeServer {
         }
     }
 
-    private static final int MAX_LINE_BYTES = 8 * 1024;
-    private static final int MAX_HEADER_COUNT = 100;
-
-    private void handleClient(Socket socket) {
-        try (socket;
-             BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8));
-             BufferedWriter out = new BufferedWriter(new OutputStreamWriter(socket.getOutputStream(), StandardCharsets.UTF_8))) {
-
-            String requestLine;
+    private void handleClient(Socket socket, long deadline) {
+        try (socket) {
+            InputStream in = socket.getInputStream();
+            OutputStream out = socket.getOutputStream();
             try {
-                requestLine = readBoundedLine(in, MAX_LINE_BYTES);
-            } catch (IOException tooLong) {
-                writeResponse(out, 431, "application/json; charset=utf-8", "{\"error\":\"line too long\"}", null);
-                return;
-            }
-            if (requestLine == null || requestLine.isBlank()) {
-                writeResponse(out, 400, "application/json; charset=utf-8", "{\"error\":\"bad request\"}", null);
-                return;
-            }
-
-            String[] reqParts = requestLine.split(" ");
-            if (reqParts.length < 2) {
-                writeResponse(out, 400, "application/json; charset=utf-8", "{\"error\":\"bad request\"}", null);
-                return;
-            }
-            String method = reqParts[0].trim().toUpperCase(Locale.ROOT);
-            String rawPath = reqParts[1].trim();
-            String path = rawPath;
-            int qIdx = rawPath.indexOf('?');
-            if (qIdx >= 0) {
-                path = rawPath.substring(0, qIdx);
-            }
-
-            int contentLength = 0;
-            String origin = null;
-            Map<String, String> headers = new HashMap<>();
-            String line;
-            int headerCount = 0;
-            while (true) {
-                try {
-                    line = readBoundedLine(in, MAX_LINE_BYTES);
-                } catch (IOException tooLong) {
-                    writeResponse(out, 431, "application/json; charset=utf-8", "{\"error\":\"header too long\"}", null);
-                    return;
+                String requestLine = readLine(in, socket, deadline);
+                String[] request = requestLine.split(" ", -1);
+                if (request.length != 3 || !request[2].equals("HTTP/1.1") || !request[1].startsWith("/"))
+                    throw new BadRequest(400, "Invalid request line");
+                Map<String, String> headers = new HashMap<>();
+                int bytes = requestLine.length(), count = 0;
+                while (true) {
+                    String line = readLine(in, socket, deadline);
+                    if (line.isEmpty()) break;
+                    bytes += line.length() + 2;
+                    if (++count > MAX_HEADER_COUNT || bytes > MAX_HEADER_BYTES)
+                        throw new BadRequest(431, "Headers exceed budget");
+                    int colon = line.indexOf(':');
+                    if (colon <= 0) throw new BadRequest(400, "Invalid header");
+                    String name = line.substring(0, colon).toLowerCase(Locale.ROOT);
+                    String value = line.substring(colon + 1).trim();
+                    if (!name.matches("[a-z0-9!#$%&'*+.^_`|~-]+") || value.chars().anyMatch(ch -> ch < 32 || ch == 127) ||
+                        headers.putIfAbsent(name, value) != null)
+                        throw new BadRequest(400, "Invalid or duplicate header");
                 }
-                if (line == null || line.isEmpty()) break;
-                if (++headerCount > MAX_HEADER_COUNT) {
-                    writeResponse(out, 431, "application/json; charset=utf-8", "{\"error\":\"too many headers\"}", null);
-                    return;
+                String origin = headers.get("origin");
+                if (headers.containsKey("transfer-encoding")) throw new BadRequest(400, "Unsupported transfer encoding");
+                int length = 0;
+                if (headers.containsKey("content-length")) {
+                    String declared = headers.get("content-length");
+                    if (!declared.matches("[0-9]{1,9}")) throw new BadRequest(400, "Invalid content length");
+                    length = Integer.parseInt(declared);
+                    if (length > MAX_FORM_BODY_BYTES) throw new BadRequest(413, "Body exceeds budget");
                 }
-                String lower = line.toLowerCase(Locale.ROOT);
-                int colon = line.indexOf(':');
-                if (colon > 0) {
-                    String headerName = line.substring(0, colon).trim().toLowerCase(Locale.ROOT);
-                    String headerValue = line.substring(colon + 1).trim();
-                    headers.put(headerName, headerValue);
-                    if ("origin".equals(headerName)) {
-                        origin = headerValue;
-                    }
+                String method = request[0];
+                String path = request[1].split("\\?", 2)[0];
+                String health = "{\"product\":\"ClientSideEye\",\"protocol\":1,\"status\":\"ok\",\"authRequired\":true}";
+                if (method.equals("OPTIONS")) {
+                    writeResponse(out, 204, "application/json", "", origin); return;
                 }
-                if (lower.startsWith("content-length:")) {
-                    try {
-                        contentLength = Integer.parseInt(line.substring("content-length:".length()).trim());
-                    } catch (Exception ignored) {
-                        contentLength = 0;
-                    }
+                if (path.equals("/api/health") && method.equals("GET")) {
+                    writeResponse(out, 200, "application/json", health, origin); return;
                 }
+                if (!path.equals("/api/finding") && !path.equals("/api/session"))
+                    throw new BadRequest(404, "Not found");
+                if ((path.equals("/api/finding") && !method.equals("POST")) ||
+                    (path.equals("/api/session") && !method.equals("GET")))
+                    throw new BadRequest(405, "Method not allowed");
+                if (validateFindingRequest(authToken, safe(headers.get(TOKEN_HEADER)), length) != 200)
+                    throw new BadRequest(401, "Unauthorized");
+                if (path.equals("/api/session")) {
+                    writeResponse(out, 200, "application/json", health, origin); return;
+                }
+                if (!headers.getOrDefault("content-type", "").split(";", 2)[0].trim().equalsIgnoreCase("application/x-www-form-urlencoded"))
+                    throw new BadRequest(415, "Expected form encoding");
+                byte[] body = new byte[length];
+                int offset = 0;
+                while (offset < length) {
+                    setReadDeadline(socket, deadline);
+                    int read = in.read(body, offset, length - offset);
+                    if (read < 0) throw new BadRequest(400, "Incomplete body");
+                    offset += read;
+                }
+                try { handleFindingPost(out, new String(body, StandardCharsets.UTF_8), origin); }
+                catch (IllegalArgumentException invalid) { throw new BadRequest(400, "Invalid finding form"); }
+            } catch (BadRequest invalid) {
+                writeResponse(out, invalid.status, "application/json", "{\"error\":\"" + invalid.getMessage() + "\"}", null);
             }
-
-            if (contentLength > MAX_FORM_BODY_BYTES) {
-                writeResponse(out, 413, "application/json; charset=utf-8", "{\"error\":\"request too large\"}", origin);
-                return;
-            }
-
-            String body = "";
-            if (contentLength > 0) {
-                char[] buf = new char[contentLength];
-                int read = 0;
-                while (read < contentLength) {
-                    int n = in.read(buf, read, contentLength - read);
-                    if (n < 0) break;
-                    read += n;
-                }
-                body = new String(buf, 0, read);
-            }
-
-            if ("OPTIONS".equals(method)) {
-                writeResponse(out, 204, "text/plain; charset=utf-8", "", origin);
-                return;
-            }
-
-            if ("/api/health".equals(path)) {
-                if (!"GET".equals(method)) {
-                    writeResponse(out, 405, "application/json; charset=utf-8", "{\"error\":\"method not allowed\"}", origin);
-                    return;
-                }
-                writeResponse(out, 200, "application/json; charset=utf-8", "{\"status\":\"ok\",\"authRequired\":true}", origin);
-                return;
-            }
-
-            if ("/api/finding".equals(path)) {
-                if (!"POST".equals(method)) {
-                    writeResponse(out, 405, "application/json; charset=utf-8", "{\"error\":\"method not allowed\"}", origin);
-                    return;
-                }
-                String providedToken = safe(headers.get(TOKEN_HEADER));
-                int validationStatus = validateFindingRequest(authToken, providedToken, contentLength);
-                if (validationStatus != 200) {
-                    String bodyText = validationStatus == 401 ? "{\"error\":\"unauthorized\"}" : "{\"error\":\"request too large\"}";
-                    writeResponse(out, validationStatus, "application/json; charset=utf-8", bodyText, origin);
-                    return;
-                }
-                handleFindingPost(out, body, origin);
-                return;
-            }
-
-            writeResponse(out, 404, "application/json; charset=utf-8", "{\"error\":\"not found\"}", origin);
-        } catch (Exception e) {
-            api.logging().logToError("[ClientSideEye] Bridge client error: " + e);
-        }
+        } catch (IOException disconnected) {
+            // A deadline, disconnect, or unload closes this one request; no request data is logged.
+        } finally { clients.remove(socket); }
     }
 
-    private void handleFindingPost(BufferedWriter out, String body, String origin) throws IOException {
+    private static final class BadRequest extends IOException {
+        final int status;
+        BadRequest(int status, String message) { super(message); this.status = status; }
+    }
+
+    private static void setReadDeadline(Socket socket, long deadline) throws IOException {
+        long remaining = deadline - System.nanoTime();
+        if (remaining <= 0) throw new SocketTimeoutException("Request deadline expired");
+        socket.setSoTimeout((int) Math.max(1, TimeUnit.NANOSECONDS.toMillis(remaining)));
+    }
+
+    private static String readLine(InputStream in, Socket socket, long deadline) throws IOException {
+        ByteArrayOutputStream line = new ByteArrayOutputStream();
+        while (line.size() <= MAX_LINE_BYTES) {
+            setReadDeadline(socket, deadline);
+            int ch = in.read();
+            if (ch < 0) throw new BadRequest(400, "Incomplete headers");
+            if (ch == '\n') {
+                byte[] bytes = line.toByteArray();
+                if (bytes.length == 0 || bytes[bytes.length - 1] != '\r') throw new BadRequest(400, "Expected CRLF");
+                return new String(bytes, 0, bytes.length - 1, StandardCharsets.ISO_8859_1);
+            }
+            line.write(ch);
+        }
+        throw new BadRequest(431, "Line exceeds budget");
+    }
+
+    private void handleFindingPost(OutputStream out, String body, String origin) throws IOException {
         Map<String, String> form = parseFormEncoded(body);
         String url = safe(form.get("url"));
         if (url.isBlank()) {
@@ -251,6 +254,11 @@ public final class BrowserBridgeServer {
             return;
         }
 
+        try {
+            URL target = new URL(url);
+            if (!Set.of("http", "https").contains(target.getProtocol()) || target.getHost().isBlank() || url.chars().anyMatch(Character::isISOControl))
+                throw new IllegalArgumentException("Invalid target URL");
+        } catch (java.net.MalformedURLException invalid) { throw new IllegalArgumentException("Invalid target URL", invalid); }
         String type = normalizeType(form.get("type"));
         Finding.Severity severity = parseSeverity(form.get("severity"));
         int confidence = parseInt(form.get("confidence"), 55);
@@ -281,11 +289,11 @@ public final class BrowserBridgeServer {
         tab.addFindings(findings);
 
         String source = defaultIfBlank(form.get("source"), "browser-extension");
-        api.logging().logToOutput("[ClientSideEye] Bridge accepted finding from " + source + " | " + type + " | " + severity + " (" + confidence + ") | " + url);
+
         writeResponse(out, 200, "application/json; charset=utf-8", "{\"accepted\":1}", origin);
     }
 
-    private static void writeResponse(BufferedWriter out, int status, String contentType, String body, String origin) throws IOException {
+    private static void writeResponse(OutputStream out, int status, String contentType, String body, String origin) throws IOException {
         String statusText = switch (status) {
             case 200 -> "OK";
             case 204 -> "No Content";
@@ -294,24 +302,21 @@ public final class BrowserBridgeServer {
             case 400 -> "Bad Request";
             case 404 -> "Not Found";
             case 405 -> "Method Not Allowed";
+            case 415 -> "Unsupported Media Type";
             case 431 -> "Request Header Fields Too Large";
             default -> "Error";
         };
         byte[] bodyBytes = body == null ? new byte[0] : body.getBytes(StandardCharsets.UTF_8);
-        out.write("HTTP/1.1 " + status + " " + statusText + "\r\n");
-        out.write("Content-Type: " + contentType + "\r\n");
-        out.write("Content-Length: " + bodyBytes.length + "\r\n");
+        StringBuilder headers = new StringBuilder("HTTP/1.1 " + status + " " + statusText + "\r\n");
+        headers.append("Content-Type: ").append(contentType).append("\r\nContent-Length: ").append(bodyBytes.length).append("\r\n");
         if (isAllowedExtensionOrigin(origin)) {
-            out.write("Access-Control-Allow-Origin: " + origin + "\r\n");
-            out.write("Vary: Origin\r\n");
-            out.write("Access-Control-Allow-Methods: GET,POST,OPTIONS\r\n");
-            out.write("Access-Control-Allow-Headers: Content-Type, X-ClientSideEye-Token\r\n");
+            headers.append("Access-Control-Allow-Origin: ").append(origin).append("\r\nVary: Origin\r\n")
+                .append("Access-Control-Allow-Methods: GET,POST,OPTIONS\r\n")
+                .append("Access-Control-Allow-Headers: Content-Type, X-ClientSideEye-Token\r\n");
         }
-        out.write("Connection: close\r\n");
-        out.write("\r\n");
-        if (bodyBytes.length > 0) {
-            out.write(new String(bodyBytes, StandardCharsets.UTF_8));
-        }
+        headers.append("Connection: close\r\n\r\n");
+        out.write(headers.toString().getBytes(StandardCharsets.ISO_8859_1));
+        out.write(bodyBytes);
         out.flush();
     }
 
@@ -324,25 +329,9 @@ public final class BrowserBridgeServer {
 
     static int validateFindingRequest(String expectedToken, String providedToken, int contentLength) {
         if (contentLength > MAX_FORM_BODY_BYTES) return 413;
-        if (!safe(expectedToken).equals(safe(providedToken))) return 401;
+        if (contentLength < 0 || safe(expectedToken).isEmpty() ||
+            !java.security.MessageDigest.isEqual(safe(expectedToken).getBytes(StandardCharsets.UTF_8), safe(providedToken).getBytes(StandardCharsets.UTF_8))) return 401;
         return 200;
-    }
-
-    private static String readBoundedLine(BufferedReader in, int maxLen) throws IOException {
-        StringBuilder sb = new StringBuilder();
-        int ch;
-        while ((ch = in.read()) != -1) {
-            if (ch == '\n') {
-                int len = sb.length();
-                if (len > 0 && sb.charAt(len - 1) == '\r') sb.setLength(len - 1);
-                return sb.toString();
-            }
-            if (sb.length() >= maxLen) {
-                throw new IOException("line exceeds maximum length of " + maxLen);
-            }
-            sb.append((char) ch);
-        }
-        return sb.length() == 0 ? null : sb.toString();
     }
 
     private static Map<String, String> parseFormEncoded(String body) {
@@ -398,7 +387,7 @@ public final class BrowserBridgeServer {
 
     private static String hostFromUrl(String url) {
         try {
-            URI u = URI.create(url);
+            URL u = new URL(url);
             return u.getHost() == null ? "" : u.getHost();
         } catch (Exception e) {
             return "";

@@ -1,6 +1,6 @@
 package com.clientsideeye.burp.core;
 
-import java.net.URI;
+import java.net.URL;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
@@ -38,6 +38,7 @@ public final class JavaScriptAnalyzer {
     private JavaScriptAnalyzer() {}
 
     public static boolean looksLikeJavaScriptForAnalysis(String url, String body) {
+        AnalysisLimits.checkBody(body);
         if (body == null || body.isBlank()) return false;
         String u = url == null ? "" : url.toLowerCase(Locale.ROOT);
         if (u.matches(".*\\.(js|mjs)(\\?.*)?$")) return true;
@@ -75,6 +76,7 @@ public final class JavaScriptAnalyzer {
      * treating as JavaScript, and must not be used to gate content whose type is already known.
      */
     public static List<Finding> analyzeJavaScriptContent(String url, String script) {
+        AnalysisLimits.checkBody(script);
         if (script == null || script.isBlank()) return List.of();
 
         List<Finding> out = new ArrayList<>();
@@ -94,6 +96,7 @@ public final class JavaScriptAnalyzer {
         while (endpointMatcher.find()) {
             String endpoint = endpointMatcher.group(1);
             if (!isInterestingPath(endpoint) || !seen.add("ep:" + endpoint)) continue;
+            AnalysisLimits.checkFindings(out.size() + 1);
             out.add(new Finding(
                     FindingType.JAVASCRIPT_ENDPOINT_REFERENCE.name(),
                     severityForEndpoint(endpoint),
@@ -120,6 +123,7 @@ public final class JavaScriptAnalyzer {
                 summary = "JavaScript references a likely GraphQL endpoint or operation path.";
             }
 
+            AnalysisLimits.checkFindings(out.size() + 1);
             out.add(new Finding(
                     FindingType.JAVASCRIPT_ENDPOINT_REFERENCE.name(),
                     confidence >= 70 ? Severity.MEDIUM : Severity.INFO,
@@ -143,6 +147,7 @@ public final class JavaScriptAnalyzer {
             if (!seen.add(sink)) continue;
             String sinkLower = sink.toLowerCase(Locale.ROOT);
             boolean highRisk = sinkLower.contains("eval") || sinkLower.contains("function") || sinkLower.contains("bypasssecuritytrust");
+            AnalysisLimits.checkFindings(out.size() + 1);
             out.add(new Finding(
                     FindingType.DOM_XSS_SINK.name(),
                     highRisk ? Severity.MEDIUM : Severity.LOW,
@@ -166,7 +171,8 @@ public final class JavaScriptAnalyzer {
         boolean checksOrigin = script.toLowerCase(Locale.ROOT).contains("event.origin")
                 || script.toLowerCase(Locale.ROOT).contains(".origin")
                 || script.toLowerCase(Locale.ROOT).contains("targetorigin");
-        out.add(new Finding(
+        AnalysisLimits.checkFindings(out.size() + 1);
+            out.add(new Finding(
                 FindingType.POSTMESSAGE_HANDLER.name(),
                 checksOrigin ? Severity.INFO : Severity.MEDIUM,
                 checksOrigin ? 55 : 75,
@@ -188,6 +194,7 @@ public final class JavaScriptAnalyzer {
         while (matcher.find()) {
             String matched = matcher.group(1);
             if (!seen.add(matched)) continue;
+            AnalysisLimits.checkFindings(out.size() + 1);
             out.add(new Finding(
                     FindingType.PROTOTYPE_POLLUTION_HINT.name(),
                     Severity.LOW,
@@ -210,6 +217,7 @@ public final class JavaScriptAnalyzer {
             String api = matcher.group(1);
             String endpoint = matcher.group(2);
             if (!seen.add(api + ":" + endpoint)) continue;
+            AnalysisLimits.checkFindings(out.size() + 1);
             out.add(new Finding(
                     FindingType.RUNTIME_NETWORK_REFERENCE.name(),
                     Severity.INFO,
@@ -248,7 +256,7 @@ public final class JavaScriptAnalyzer {
 
     private static String hostFromUrl(String url) {
         try {
-            URI u = URI.create(url);
+            URL u = new URL(url);
             return u.getHost() == null ? "" : u.getHost();
         } catch (Exception e) {
             return "";

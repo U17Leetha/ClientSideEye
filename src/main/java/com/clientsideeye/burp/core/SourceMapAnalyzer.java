@@ -1,6 +1,6 @@
 package com.clientsideeye.burp.core;
 
-import java.net.URI;
+import java.net.URL;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -14,10 +14,6 @@ import static com.clientsideeye.burp.core.Finding.Severity;
 public final class SourceMapAnalyzer {
 
     private static final Pattern SOURCE_MAPPING_URL_PATTERN = Pattern.compile("(?im)//[#@]\\s*sourceMappingURL\\s*=\\s*([^\\s]+)");
-    private static final Pattern SOURCES_ARRAY_PATTERN = Pattern.compile("(?is)\"sources\"\\s*:\\s*\\[(.*?)\\]");
-    private static final Pattern SOURCE_ITEM_PATTERN = Pattern.compile("(?is)\"((?:\\\\.|[^\"])*)\"");
-    private static final Pattern SOURCES_CONTENT_PATTERN = Pattern.compile("(?is)\"sourcesContent\"\\s*:\\s*\\[(.*?)\\]\\s*(?:,\\s*\"|\\}\\s*$)");
-
     private SourceMapAnalyzer() {}
 
     public static boolean looksLikeSourceMap(String url, String body) {
@@ -33,11 +29,54 @@ public final class SourceMapAnalyzer {
     public static List<Finding> analyzeSourceMap(String url, String body) {
         if (!looksLikeSourceMap(url, body)) return List.of();
 
-        List<Finding> out = new ArrayList<>();
-        String host = hostFromUrl(url);
-        addDisclosureFinding(out, url, host, body);
-        addEmbeddedSourceFindings(out, url, host, body);
-        return out;
+        AnalysisLimits.checkBody(body);
+        com.google.gson.stream.JsonReader reader = new com.google.gson.stream.JsonReader(new java.io.StringReader(body));
+        reader.setStrictness(com.google.gson.Strictness.STRICT);
+        reader.setNestingLimit(AnalysisLimits.MAX_DEPTH);
+        try {
+            com.google.gson.JsonElement parsed = com.google.gson.JsonParser.parseReader(reader);
+            if (reader.peek() != com.google.gson.stream.JsonToken.END_DOCUMENT || !parsed.isJsonObject())
+                throw new IllegalArgumentException("Source map must be one JSON object.");
+            com.google.gson.JsonObject map = parsed.getAsJsonObject();
+            if (!map.has("version") || !map.get("version").isJsonPrimitive() || !map.get("version").getAsString().equals("3"))
+                throw new IllegalArgumentException("Only version 3 source maps are supported.");
+            List<Finding> out = new ArrayList<>();
+            String host = hostFromUrl(url);
+            out.add(new Finding(FindingType.SOURCE_MAP_DISCLOSURE.name(), Severity.MEDIUM, 82,
+                url, host, "Source map exposed in response", "A source map exposes client-side implementation details.",
+                shrink(body, 240), "Review disclosed sources and restrict production exposure where appropriate.", "sourcemap"));
+            if (map.has("sections"))
+                throw new IllegalArgumentException("Indexed source maps are not supported; inspect their component maps individually.");
+            if (!map.has("sources") || !map.get("sources").isJsonArray())
+                throw new IllegalArgumentException("Source map sources must be an array.");
+            var sources = map.getAsJsonArray("sources");
+            if (sources.size() > AnalysisLimits.MAX_FINDINGS)
+                throw new IllegalArgumentException("Source map exceeds the 1000-source budget.");
+            if (!map.has("sourcesContent")) return out;
+            if (!map.get("sourcesContent").isJsonArray())
+                throw new IllegalArgumentException("Source map sourcesContent must be an array.");
+            var contents = map.getAsJsonArray("sourcesContent");
+            if (contents.size() != sources.size())
+                throw new IllegalArgumentException("Source map source/content arrays must have matching lengths.");
+            for (int i = 0; i < contents.size(); i++) {
+                var source = sources.get(i);
+                var content = contents.get(i);
+                if (!source.isJsonPrimitive() || !source.getAsJsonPrimitive().isString())
+                    throw new IllegalArgumentException("Source paths must be strings.");
+                if (content.isJsonNull()) continue;
+                if (!content.isJsonPrimitive() || !content.getAsJsonPrimitive().isString())
+                    throw new IllegalArgumentException("Source content must be a string or null.");
+                for (Finding finding : JavaScriptAnalyzer.analyzeJavaScriptContent(url, content.getAsString())) {
+                    AnalysisLimits.checkFindings(out.size() + 1);
+                    out.add(new Finding(finding.type(), finding.severity(), finding.confidence(), finding.url(),
+                        finding.host(), finding.title(), finding.summary(), "[source: " + source.getAsString() + "] " + finding.evidence(),
+                        finding.recommendation(), finding.identity() + "|source-index:" + i, finding.firstSeen()));
+                }
+            }
+            return out;
+        } catch (java.io.IOException | com.google.gson.JsonParseException | IllegalStateException error) {
+            throw new IllegalArgumentException("Invalid or over-depth source map JSON.", error);
+        }
     }
 
     public static List<Finding> analyzeSourceMappingReference(String url, String body) {
@@ -61,100 +100,9 @@ public final class SourceMapAnalyzer {
         ));
     }
 
-    private static void addDisclosureFinding(List<Finding> out, String url, String host, String body) {
-        List<String> sources = parseSources(body);
-        String evidence = sources.isEmpty()
-                ? shrink(body, 240)
-                : shrink(String.join(", ", sources.subList(0, Math.min(8, sources.size()))), 240);
-        out.add(new Finding(
-                FindingType.SOURCE_MAP_DISCLOSURE.name(),
-                Severity.MEDIUM,
-                82,
-                url,
-                host,
-                "Source map exposed in response",
-                "A source map response is accessible. Source maps can reveal original source paths, comments, endpoints, and unminified code that materially expand the client-side review surface.",
-                evidence,
-                "Restrict source map exposure in production unless explicitly required. Review whether the map leaks internal structure, routes, secrets, or dangerous client-side logic.",
-                "sourcemap:" + Integer.toHexString(evidence.hashCode())
-        ));
-    }
-
-    private static void addEmbeddedSourceFindings(List<Finding> out, String url, String host, String body) {
-        for (String sourceBody : parseSourcesContent(body)) {
-            if (sourceBody.isBlank()) continue;
-            out.addAll(JavaScriptAnalyzer.analyzeJavaScriptContent(url, sourceBody));
-        }
-    }
-
-    private static List<String> parseSources(String body) {
-        Matcher matcher = SOURCES_ARRAY_PATTERN.matcher(body);
-        if (!matcher.find()) return List.of();
-        String content = matcher.group(1);
-        Set<String> out = new LinkedHashSet<>();
-        Matcher itemMatcher = SOURCE_ITEM_PATTERN.matcher(content);
-        while (itemMatcher.find()) {
-            out.add(unescapeJson(itemMatcher.group(1)));
-        }
-        return new ArrayList<>(out);
-    }
-
-    private static List<String> parseSourcesContent(String body) {
-        Matcher matcher = SOURCES_CONTENT_PATTERN.matcher(body);
-        if (!matcher.find()) return List.of();
-        String content = matcher.group(1);
-        List<String> out = new ArrayList<>();
-        StringBuilder current = new StringBuilder();
-        boolean inString = false;
-        boolean escaped = false;
-
-        for (int i = 0; i < content.length(); i++) {
-            char ch = content.charAt(i);
-            if (!inString) {
-                if (ch == '"') {
-                    inString = true;
-                    current.setLength(0);
-                }
-                continue;
-            }
-
-            if (escaped) {
-                current.append(ch);
-                escaped = false;
-                continue;
-            }
-
-            if (ch == '\\') {
-                escaped = true;
-                current.append(ch);
-                continue;
-            }
-
-            if (ch == '"') {
-                inString = false;
-                out.add(unescapeJson(current.toString()));
-                continue;
-            }
-
-            current.append(ch);
-        }
-
-        return out;
-    }
-
-    private static String unescapeJson(String text) {
-        return text
-                .replace("\\\\", "\\")
-                .replace("\\/", "/")
-                .replace("\\\"", "\"")
-                .replace("\\n", "\n")
-                .replace("\\r", "\r")
-                .replace("\\t", "\t");
-    }
-
     private static String hostFromUrl(String url) {
         try {
-            URI u = URI.create(url);
+            URL u = new URL(url);
             return u.getHost() == null ? "" : u.getHost();
         } catch (Exception e) {
             return "";

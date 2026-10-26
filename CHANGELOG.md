@@ -2,6 +2,24 @@
 
 This file tracks changes, improvements, and feature requests for ClientSideEye-Burp.
 
+## Unreleased
+
+### Robustness hardening (reviewed against sibling-extension reviewer feedback)
+
+- Browser bridge request parsing fails closed: malformed request lines, invalid or
+  duplicate headers, oversized header blocks, unsupported `Transfer-Encoding`, and bad
+  `Content-Length` values now return structured 4xx JSON errors instead of surfacing as
+  handler exceptions; unusual security-testing query strings still parse.
+- Bridge URL validation accepts lenient URLs but rejects blank hosts and control
+  characters, returning HTTP 400 rather than throwing.
+- Shared `ResponseAnalyzer` dispatch with `AnalysisLimits` body budgets replaces
+  per-entry-point analysis logic; context-menu and Site Map runs isolate errors per
+  item so one malformed response can never abort a batch or touch the Swing thread.
+- Bridge bind loop closes each candidate socket on failure, reports the last actual
+  cause, and logs the real bound port on fallback.
+- Extension artifact renamed to `ClientSideEye-Burp.jar`; CI/workflow and Gradle
+  wrapper refreshed; new hardening and network tests cover all of the above.
+
 ## 0.2.0 - 2026-07-22
 
 ### Browser Bridge: external script and source map fetching
